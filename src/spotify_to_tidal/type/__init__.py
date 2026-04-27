@@ -1,4 +1,4 @@
-from .config import SpotifyConfig, TidalConfig, PlaylistConfig, SyncConfig
+from .config import SpotifyConfig, TidalConfig, PlaylistConfig, SyncConfig, SyncDirectionLiteral, ConflictResolutionLiteral
 from .spotify import SpotifyTrack
 
 from spotipy import Spotify
@@ -15,6 +15,8 @@ __all__ = [
     "TidalConfig",
     "PlaylistConfig",
     "SyncConfig",
+    "SyncDirectionLiteral",
+    "ConflictResolutionLiteral",
     "TidalPlaylist",
     "TidalID",
     "SpotifyID",

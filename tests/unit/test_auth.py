@@ -6,7 +6,7 @@ import tidalapi
 import yaml
 import sys
 from unittest import mock
-from spotify_to_tidal.auth import open_spotify_session, open_tidal_session, SPOTIFY_SCOPES
+from spotify_to_tidal.auth import open_spotify_session, open_tidal_session, SPOTIFY_SCOPES, SPOTIFY_WRITE_SCOPES
 
 
 def test_open_spotify_session(mocker):
@@ -73,3 +73,89 @@ def test_open_spotify_session_oauth_error(mocker):
     # Call the function under test and assert sys.exit is called
     open_spotify_session(mock_config)
     mock_sys_exit.assert_called_once()
+
+
+@pytest.mark.parametrize("sync_direction", ["tidal_to_spotify", "bidirectional"])
+def test_open_spotify_session_write_scopes(mocker, sync_direction):
+    """When sync_direction requires writing to Spotify, write scopes are appended."""
+    mock_spotify_oauth = mocker.patch(
+        "spotify_to_tidal.auth.spotipy.SpotifyOAuth", autospec=True
+    )
+    mocker.patch("spotify_to_tidal.auth.spotipy.Spotify", autospec=True)
+    mock_spotify_oauth.return_value.get_access_token.return_value = "mock_access_token"
+
+    mock_config = {
+        "username": "test_user",
+        "client_id": "test_client_id",
+        "client_secret": "test_client_secret",
+        "redirect_uri": "http://127.0.0.1/",
+    }
+
+    open_spotify_session(mock_config, sync_direction=sync_direction)
+
+    expected_scope = SPOTIFY_SCOPES + ', ' + SPOTIFY_WRITE_SCOPES
+    mock_spotify_oauth.assert_called_once_with(
+        username="test_user",
+        scope=expected_scope,
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        redirect_uri="http://127.0.0.1/",
+        requests_timeout=2,
+        open_browser=True,
+    )
+
+
+def test_open_spotify_session_read_only_scopes_by_default(mocker):
+    """Default sync_direction (spotify_to_tidal) uses read-only scopes."""
+    mock_spotify_oauth = mocker.patch(
+        "spotify_to_tidal.auth.spotipy.SpotifyOAuth", autospec=True
+    )
+    mocker.patch("spotify_to_tidal.auth.spotipy.Spotify", autospec=True)
+    mock_spotify_oauth.return_value.get_access_token.return_value = "mock_access_token"
+
+    mock_config = {
+        "username": "test_user",
+        "client_id": "test_client_id",
+        "client_secret": "test_client_secret",
+        "redirect_uri": "http://127.0.0.1/",
+    }
+
+    open_spotify_session(mock_config)
+
+    mock_spotify_oauth.assert_called_once_with(
+        username="test_user",
+        scope=SPOTIFY_SCOPES,
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        redirect_uri="http://127.0.0.1/",
+        requests_timeout=2,
+        open_browser=True,
+    )
+
+
+def test_open_spotify_session_spotify_to_tidal_read_only(mocker):
+    """Explicit spotify_to_tidal direction uses read-only scopes."""
+    mock_spotify_oauth = mocker.patch(
+        "spotify_to_tidal.auth.spotipy.SpotifyOAuth", autospec=True
+    )
+    mocker.patch("spotify_to_tidal.auth.spotipy.Spotify", autospec=True)
+    mock_spotify_oauth.return_value.get_access_token.return_value = "mock_access_token"
+
+    mock_config = {
+        "username": "test_user",
+        "client_id": "test_client_id",
+        "client_secret": "test_client_secret",
+        "redirect_uri": "http://127.0.0.1/",
+    }
+
+    open_spotify_session(mock_config, sync_direction="spotify_to_tidal")
+
+    mock_spotify_oauth.assert_called_once_with(
+        username="test_user",
+        scope=SPOTIFY_SCOPES,
+        client_id="test_client_id",
+        client_secret="test_client_secret",
+        redirect_uri="http://127.0.0.1/",
+        requests_timeout=2,
+        open_browser=True,
+    )

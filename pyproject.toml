@@ -14,7 +14,9 @@ dependencies = [
   "tqdm~=4.64",
   "sqlalchemy~=2.0",
   "pytest~=8.0",
-  "pytest-mock~=3.8"
+  "pytest-mock~=3.8",
+  "typing_extensions~=4.0",
+  "hypothesis~=6.0"
 ]
 
 [tools.setuptools.packages."spotify_to_tidal"]

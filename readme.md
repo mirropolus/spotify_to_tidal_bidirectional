@@ -1,4 +1,4 @@
-A command line tool for importing your Spotify playlists into Tidal. Due to various performance optimisations, it is particularly suited for periodic synchronisation of very large collections.
+A command line tool for synchronizing playlists between Spotify and Tidal. Supports one-way sync (Spotify → Tidal or Tidal → Spotify) as well as full bidirectional sync. Due to various performance optimisations, it is particularly suited for periodic synchronisation of very large collections.
 
 Installation
 -----------
@@ -18,7 +18,7 @@ Setup
 
 Usage
 ----
-To synchronize all of your Spotify playlists with your Tidal account run the following from the project root directory
+To synchronize all of your Spotify playlists with your Tidal account run the following from the project root directory.
 Windows ignores python module paths by default, but you can run them using `python3 -m spotify_to_tidal`
 
 ```bash
@@ -37,7 +37,57 @@ or sync just your 'Liked Songs' with:
 spotify_to_tidal --sync-favorites
 ```
 
-See example_config.yml for more configuration options, and `spotify_to_tidal --help` for more options.
+#### Bidirectional sync
+
+To sync Tidal playlists back to Spotify (useful if you add tracks on Tidal and want them reflected in Spotify):
+
+```bash
+spotify_to_tidal --sync-direction tidal_to_spotify
+```
+
+To keep both services fully in sync with each other:
+
+```bash
+spotify_to_tidal --sync-direction bidirectional
+```
+
+The `--sync-direction` flag accepts three values:
+
+| Value | Behaviour |
+|---|---|
+| `spotify_to_tidal` | *(default)* Spotify → Tidal only |
+| `tidal_to_spotify` | Tidal → Spotify only |
+| `bidirectional` | Both directions |
+
+You can also set the direction permanently in `config.yml`:
+
+```yaml
+sync_direction: bidirectional
+```
+
+#### Conflict resolution
+
+When running bidirectional sync, both playlists may have diverged since the last run. You can control which service wins:
+
+```yaml
+conflict_resolution: spotify_wins  # default
+# conflict_resolution: tidal_wins
+```
+
+With `spotify_wins` (the default), the Spotify version overwrites Tidal when a conflict is detected. With `tidal_wins`, the Tidal version overwrites Spotify.
+
+#### Per-playlist sync direction
+
+If you use `sync_playlists` in your config to sync specific playlists, you can set a different direction per playlist:
+
+```yaml
+sync_playlists:
+  - spotify_id: 1ABCDEqsABCD6EaABCDa0a
+    tidal_id: a0b1234-0a1b-012a-abcd-a1b234c5d6d7
+    sync_direction: tidal_to_spotify  # overrides the global sync_direction for this playlist
+```
+
+See `example_config.yml` for all configuration options, and `spotify_to_tidal --help` for all CLI flags.
 
 ---
 

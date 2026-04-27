@@ -12,10 +12,16 @@ __all__ = [
 ]
 
 SPOTIFY_SCOPES = 'playlist-read-private, user-library-read'
+SPOTIFY_WRITE_SCOPES = 'playlist-modify-public, playlist-modify-private, user-library-modify'
 
-def open_spotify_session(config) -> spotipy.Spotify:
+def open_spotify_session(config, sync_direction: str = "spotify_to_tidal") -> spotipy.Spotify:
+    if sync_direction in ("tidal_to_spotify", "bidirectional"):
+        scope = SPOTIFY_SCOPES + ', ' + SPOTIFY_WRITE_SCOPES
+    else:
+        scope = SPOTIFY_SCOPES
+
     credentials_manager = spotipy.SpotifyOAuth(username=config['username'],
-       scope=SPOTIFY_SCOPES,
+       scope=scope,
        client_id=config['client_id'],
        client_secret=config['client_secret'],
        redirect_uri=config['redirect_uri'],

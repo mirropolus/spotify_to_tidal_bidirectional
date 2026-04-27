@@ -82,3 +82,4 @@ class TrackMatchCache:
 # Main singleton instance
 failure_cache = MatchFailureDatabase()
 track_match_cache = TrackMatchCache()
+reverse_track_match_cache = TrackMatchCache()  # Maps "tidal:{tidal_id}" -> spotify_id (str)

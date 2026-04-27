@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
-from .cache import failure_cache, track_match_cache
+from .cache import failure_cache, track_match_cache, reverse_track_match_cache
 import datetime
 from difflib import SequenceMatcher
 from functools import partial
@@ -20,6 +20,42 @@ import unicodedata
 import math
 
 from .type import spotify as t_spotify
+from .type import SyncDirectionLiteral, PlaylistConfig
+
+_VALID_SYNC_DIRECTIONS = {"spotify_to_tidal", "tidal_to_spotify", "bidirectional"}
+
+
+def resolve_sync_direction(config: dict, cli_override: str | None) -> SyncDirectionLiteral:
+    """
+    Returns the effective sync direction.
+    Priority: CLI argument > config file > default ("spotify_to_tidal").
+    Raises SystemExit with a descriptive message for invalid values.
+    """
+    if cli_override is not None:
+        direction = cli_override
+    else:
+        direction = config.get("sync_direction", "spotify_to_tidal")
+
+    if direction not in _VALID_SYNC_DIRECTIONS:
+        sys.exit(
+            f"Invalid sync_direction '{direction}'. "
+            f"Must be one of: {', '.join(sorted(_VALID_SYNC_DIRECTIONS))}."
+        )
+    return direction  # type: ignore[return-value]
+
+
+def resolve_playlist_sync_direction(
+    playlist_config: PlaylistConfig | None,
+    global_direction: SyncDirectionLiteral,
+) -> SyncDirectionLiteral:
+    """
+    Returns the effective sync direction for a single playlist.
+    Per-playlist sync_direction overrides the global direction.
+    """
+    if playlist_config is not None and "sync_direction" in playlist_config:
+        return playlist_config["sync_direction"]
+    return global_direction
+
 
 def normalize(s) -> str:
     return unicodedata.normalize('NFD', s).encode('ascii', 'ignore').decode('ascii')
@@ -133,6 +169,106 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
 
     # if none of the search modes succeeded then store the track id to the failure cache
     failure_cache.cache_match_failure(spotify_track['id'])
+
+async def spotify_search(tidal_track: tidalapi.Track, rate_limiter: asyncio.Semaphore, spotify_session: spotipy.Spotify):
+    """
+    Searches Spotify for the equivalent of a Tidal track.
+    1. Try ISRC match via spotify_session.search(q=f"isrc:{tidal_track.isrc}", type="track")
+    2. Fall back to name + first artist search, then verify with match()
+    Records failure in failure_cache on miss (key: "tidal:{tidal_track.id}").
+    """
+    cache_key = f"tidal:{tidal_track.id}"
+
+    # Step 1: attempt ISRC match
+    await rate_limiter.acquire()
+    isrc_results = await asyncio.to_thread(
+        spotify_session.search,
+        q=f"isrc:{tidal_track.isrc}",
+        type="track"
+    )
+    for candidate in isrc_results.get('tracks', {}).get('items', []):
+        if match(tidal_track, candidate):
+            failure_cache.remove_match_failure(cache_key)
+            return candidate
+
+    # Step 2: fall back to name + first artist search
+    await rate_limiter.acquire()
+    name_results = await asyncio.to_thread(
+        spotify_session.search,
+        q=f"{simple(tidal_track.name)} {simple(tidal_track.artists[0].name)}",
+        type="track"
+    )
+    for candidate in name_results.get('tracks', {}).get('items', []):
+        if match(tidal_track, candidate):
+            failure_cache.remove_match_failure(cache_key)
+            return candidate
+
+    # Both steps failed — record the miss
+    failure_cache.cache_match_failure(cache_key)
+    return None
+
+
+async def search_new_tracks_on_spotify(spotify_session: spotipy.Spotify, tidal_tracks: Sequence[tidalapi.Track], playlist_name: str, config: dict):
+    """
+    Mirrors search_new_tracks_on_tidal for the reverse direction.
+    Populates reverse_track_match_cache and appends unmatched tracks to
+    "songs not found.txt" with the same format.
+    """
+    async def _run_rate_limiter(semaphore):
+        ''' Leaky bucket algorithm for rate limiting. Periodically releases items from semaphore at rate_limit'''
+        _sleep_time = config.get('max_concurrency', 10) / config.get('rate_limit', 10) / 4
+        t0 = datetime.datetime.now()
+        while True:
+            await asyncio.sleep(_sleep_time)
+            t = datetime.datetime.now()
+            dt = (t - t0).total_seconds()
+            new_items = round(config.get('rate_limit', 10) * dt)
+            t0 = t
+            [semaphore.release() for i in range(new_items)]
+
+    # Filter out tracks already in the failure cache (retry interval not elapsed)
+    # and tracks already present in reverse_track_match_cache
+    tracks_to_search = [
+        track for track in tidal_tracks
+        if not failure_cache.has_match_failure(f"tidal:{track.id}")
+        and not reverse_track_match_cache.get(f"tidal:{track.id}")
+    ]
+
+    if not tracks_to_search:
+        return
+
+    # Search for each of the tracks on Spotify concurrently
+    task_description = "Searching Spotify for {}/{} tracks in Tidal playlist '{}'".format(
+        len(tracks_to_search), len(tidal_tracks), playlist_name
+    )
+    semaphore = asyncio.Semaphore(config.get('max_concurrency', 10))
+    rate_limiter_task = asyncio.create_task(_run_rate_limiter(semaphore))
+    search_results = await atqdm.gather(
+        *[repeat_on_request_error(spotify_search, t, semaphore, spotify_session) for t in tracks_to_search],
+        desc=task_description
+    )
+    rate_limiter_task.cancel()
+
+    # Add the search results to the reverse cache
+    song404 = []
+    for idx, tidal_track in enumerate(tracks_to_search):
+        if search_results[idx]:
+            reverse_track_match_cache.insert((f"tidal:{tidal_track.id}", search_results[idx]['id']))
+        else:
+            artist_names = ', '.join([a.name for a in tidal_track.artists])
+            entry = f"tidal:{tidal_track.id}: {artist_names} - {tidal_track.name}"
+            song404.append(entry)
+            color = ('\033[91m', '\033[0m')
+            print(color[0] + "Could not find the track " + entry + color[1])
+
+    if song404:
+        file_name = "songs not found.txt"
+        header = f"==========================\nPlaylist: {playlist_name}\n==========================\n"
+        with open(file_name, "a", encoding="utf-8") as file:
+            file.write(header)
+            for song in song404:
+                file.write(f"{song}\n")
+
 
 async def repeat_on_request_error(function, *args, remaining=5, **kwargs):
     # utility to repeat calling the function up to 5 times if an exception is thrown
@@ -318,6 +454,151 @@ async def sync_playlist(spotify_session: spotipy.Spotify, tidal_session: tidalap
         clear_tidal_playlist(tidal_playlist)
         add_multiple_tracks_to_playlist(tidal_playlist, new_tidal_track_ids)
 
+async def sync_playlist_tidal_to_spotify(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    tidal_playlist: tidalapi.Playlist,
+    spotify_playlist,
+    config: dict,
+) -> None:
+    """
+    Reads tracks from tidal_playlist, searches for Spotify equivalents,
+    then creates or updates the Spotify playlist.
+    Creates a new Spotify playlist if spotify_playlist is None.
+    """
+    # Step 1: load tracks from the Tidal playlist
+    tidal_tracks = await get_all_playlist_tracks(tidal_playlist)
+    if len(tidal_tracks) == 0:
+        return  # nothing to do
+
+    # Step 2/3: resolve or create the Spotify playlist
+    if spotify_playlist is None:
+        print(
+            f"No playlist found on Spotify corresponding to Tidal playlist: "
+            f"'{tidal_playlist.name}', creating new playlist"
+        )
+        spotify_playlist = await repeat_on_request_error(
+            asyncio.to_thread,
+            spotify_session.user_playlist_create,
+            spotify_session.current_user()['id'],
+            tidal_playlist.name,
+            description=tidal_playlist.description or "",
+        )
+        old_spotify_tracks = []
+    else:
+        # Step 4: load existing tracks from the Spotify playlist
+        old_spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist)
+
+    # Step 5: search for Tidal tracks on Spotify, populating reverse_track_match_cache
+    await search_new_tracks_on_spotify(spotify_session, tidal_tracks, tidal_playlist.name, config)
+
+    # Step 6: build the new Spotify track ID list, skipping duplicates
+    new_spotify_track_ids = []
+    seen: set = set()
+    for tidal_track in tidal_tracks:
+        spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
+        if spotify_id and spotify_id not in seen:
+            new_spotify_track_ids.append(spotify_id)
+            seen.add(spotify_id)
+
+    # Step 7: compare new vs. existing Spotify track IDs and update if needed
+    old_spotify_track_ids = [t['id'] for t in old_spotify_tracks]
+
+    if new_spotify_track_ids == old_spotify_track_ids:
+        print("No changes to write to Spotify playlist")
+        return
+
+    if new_spotify_track_ids[:len(old_spotify_track_ids)] == old_spotify_track_ids:
+        # Append-only case: only add the new tracks at the end
+        tracks_to_add = new_spotify_track_ids[len(old_spotify_track_ids):]
+        await repeat_on_request_error(
+            asyncio.to_thread,
+            spotify_session.playlist_add_items,
+            spotify_playlist['id'],
+            tracks_to_add,
+        )
+    else:
+        # Reorder/replace case: clear the playlist then re-add all tracks in batches of 100
+        await repeat_on_request_error(
+            asyncio.to_thread,
+            spotify_session.playlist_replace_items,
+            spotify_playlist['id'],
+            [],
+        )
+        for i in range(0, len(new_spotify_track_ids), 100):
+            batch = new_spotify_track_ids[i:i + 100]
+            await repeat_on_request_error(
+                asyncio.to_thread,
+                spotify_session.playlist_add_items,
+                spotify_playlist['id'],
+                batch,
+            )
+
+
+def detect_conflict(
+    spotify_tracks: Sequence,
+    tidal_tracks: Sequence,
+) -> bool:
+    """
+    Returns True if both playlists have tracks not present in the other,
+    indicating divergence on both sides.
+    Uses the match() predicate for cross-service track comparison.
+    """
+    # Check if any Tidal track has no match in spotify_tracks
+    tidal_has_unmatched = any(
+        not any(match(tidal_track, spotify_track) for spotify_track in spotify_tracks)
+        for tidal_track in tidal_tracks
+    )
+    # Check if any Spotify track has no match in tidal_tracks
+    spotify_has_unmatched = any(
+        not any(match(tidal_track, spotify_track) for tidal_track in tidal_tracks)
+        for spotify_track in spotify_tracks
+    )
+    return tidal_has_unmatched and spotify_has_unmatched
+
+
+async def sync_playlist_bidirectional(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    spotify_playlist,
+    tidal_playlist: tidalapi.Playlist | None,
+    config: dict,
+) -> None:
+    """
+    Detects conflict between the two playlists.
+    Applies conflict_resolution policy from config (default: "spotify_wins").
+    Logs the playlist name and resolution action before proceeding.
+    Delegates to sync_playlist (S→T) or sync_playlist_tidal_to_spotify (T→S).
+    """
+    # Step 1: load both track lists
+    spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist)
+    tidal_tracks = await get_all_playlist_tracks(tidal_playlist) if tidal_playlist is not None else []
+
+    # Step 2: detect conflict
+    conflict = detect_conflict(spotify_tracks, tidal_tracks)
+
+    # Step 3: get conflict resolution policy
+    policy = config.get("conflict_resolution", "spotify_wins")
+
+    # Step 4: log if conflict detected
+    if conflict:
+        print(f"Conflict detected in playlist '{spotify_playlist['name']}': applying policy '{policy}'")
+
+    # Step 5 & 6: apply policy
+    if policy == "tidal_wins":
+        if tidal_playlist is None:
+            # Nothing to sync from Tidal if there is no Tidal playlist
+            return
+        await sync_playlist_tidal_to_spotify(
+            spotify_session, tidal_session, tidal_playlist, spotify_playlist, config
+        )
+    else:
+        # Default: "spotify_wins" — sync Spotify → Tidal
+        await sync_playlist(
+            spotify_session, tidal_session, spotify_playlist, tidal_playlist, config
+        )
+
+
 async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
     """ sync user favorites to tidal """
     async def get_tracks_from_spotify_favorites() -> List[dict]:
@@ -348,6 +629,37 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
     else:
         print("No new tracks to add to Tidal favorites")
 
+async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict) -> None:
+    """
+    Reads Tidal favorites, searches for Spotify equivalents,
+    and adds matched tracks to Spotify Liked Songs (skipping duplicates).
+    """
+    print("Loading favorite tracks from Tidal")
+    tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+
+    print("Loading existing Liked Songs from Spotify")
+    _get_liked_tracks = lambda offset: spotify_session.current_user_saved_tracks(offset=offset)
+    existing_spotify_liked = await repeat_on_request_error(_fetch_all_from_spotify_in_chunks, _get_liked_tracks)
+
+    existing_liked_ids = {t['id'] for t in existing_spotify_liked if t}
+
+    await search_new_tracks_on_spotify(spotify_session, tidal_tracks, "Favorites", config)
+
+    new_liked_ids = []
+    for tidal_track in tidal_tracks:
+        spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
+        if spotify_id and spotify_id not in existing_liked_ids:
+            new_liked_ids.append(spotify_id)
+
+    if not new_liked_ids:
+        print("No new tracks to add to Spotify Liked Songs")
+        return
+
+    for i in tqdm(range(0, len(new_liked_ids), 50), desc="Adding new tracks to Spotify Liked Songs"):
+        batch = new_liked_ids[i:i + 50]
+        await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
+
+
 def sync_playlists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
   for spotify_playlist, tidal_playlist in playlists:
     # sync the spotify playlist to tidal
@@ -355,6 +667,19 @@ def sync_playlists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tida
 
 def sync_favorites_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
     asyncio.run(main=sync_favorites(spotify_session=spotify_session, tidal_session=tidal_session, config=config))
+
+def sync_playlists_tidal_to_spotify_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
+    """Wrapper for Tidal→Spotify playlist sync. playlists is a list of (tidal_playlist, spotify_playlist) tuples."""
+    for tidal_playlist, spotify_playlist in playlists:
+        asyncio.run(sync_playlist_tidal_to_spotify(spotify_session, tidal_session, tidal_playlist, spotify_playlist, config))
+
+def sync_playlists_bidirectional_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
+    """Wrapper for bidirectional playlist sync. playlists is a list of (spotify_playlist, tidal_playlist) tuples."""
+    for spotify_playlist, tidal_playlist in playlists:
+        asyncio.run(sync_playlist_bidirectional(spotify_session, tidal_session, spotify_playlist, tidal_playlist, config))
+
+def sync_favorites_tidal_to_spotify_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
+    asyncio.run(sync_favorites_tidal_to_spotify(spotify_session=spotify_session, tidal_session=tidal_session, config=config))
 
 def get_tidal_playlists_wrapper(tidal_session: tidalapi.Session) -> Mapping[str, tidalapi.Playlist]:
     tidal_playlists = asyncio.run(get_all_playlists(tidal_session.user))
@@ -368,12 +693,34 @@ def pick_tidal_playlist_for_spotify_playlist(spotify_playlist, tidal_playlists: 
     else:
       return (spotify_playlist, None)
 
-def get_user_playlist_mappings(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
+def get_user_playlist_mappings(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config, sync_direction: str = "spotify_to_tidal"):
     results = []
-    spotify_playlists = asyncio.run(get_playlists_from_spotify(spotify_session, config))
     tidal_playlists = get_tidal_playlists_wrapper(tidal_session)
-    for spotify_playlist in spotify_playlists:
-        results.append( pick_tidal_playlist_for_spotify_playlist(spotify_playlist, tidal_playlists) )
+
+    if sync_direction == "tidal_to_spotify":
+        # Enumerate Tidal playlists and pair each with a matching Spotify playlist by name (or None)
+        spotify_playlists = asyncio.run(get_playlists_from_spotify(spotify_session, config))
+        spotify_by_name = {p['name']: p for p in spotify_playlists}
+        for tidal_name, tidal_playlist in tidal_playlists.items():
+            spotify_playlist = spotify_by_name.get(tidal_name, None)
+            results.append((tidal_playlist, spotify_playlist))
+    elif sync_direction == "bidirectional":
+        # Enumerate BOTH Spotify and Tidal playlists, merge by name (union)
+        # Return (spotify_playlist, tidal_playlist) tuples where either may be None
+        spotify_playlists = asyncio.run(get_playlists_from_spotify(spotify_session, config))
+        spotify_by_name = {p['name']: p for p in spotify_playlists}
+        tidal_by_name = dict(tidal_playlists)  # already a name->playlist mapping
+
+        all_names = set(spotify_by_name.keys()) | set(tidal_by_name.keys())
+        for name in all_names:
+            spotify_playlist = spotify_by_name.get(name, None)
+            tidal_playlist = tidal_by_name.get(name, None)
+            results.append((spotify_playlist, tidal_playlist))
+    else:
+        # Default: spotify_to_tidal — existing behavior unchanged
+        spotify_playlists = asyncio.run(get_playlists_from_spotify(spotify_session, config))
+        for spotify_playlist in spotify_playlists:
+            results.append(pick_tidal_playlist_for_spotify_playlist(spotify_playlist, tidal_playlists))
     return results
 
 async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
@@ -397,7 +744,7 @@ async def get_playlists_from_spotify(spotify_session: spotipy.Spotify, config):
     exclude_filter = lambda p: not p['id'] in exclude_list
     return list(filter( exclude_filter, filter( my_playlist_filter, playlists )))
 
-def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
+def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config, sync_direction: str = "spotify_to_tidal"):
     # get the list of playlist sync mappings from the configuration file
     def get_playlist_ids(config):
         return [(item['spotify_id'], item['tidal_id']) for item in config['sync_playlists']]
@@ -413,6 +760,10 @@ def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: t
         except Exception as e:
             print(f"Error getting Tidal playlist {tidal_id}")
             raise e
-        output.append((spotify_playlist, tidal_playlist))
+        if sync_direction == "tidal_to_spotify":
+            output.append((tidal_playlist, spotify_playlist))
+        else:
+            # "spotify_to_tidal" and "bidirectional" both use (spotify_playlist, tidal_playlist)
+            output.append((spotify_playlist, tidal_playlist))
     return output
 

@@ -5,11 +5,17 @@ spotify:
   redirect_uri: http://127.0.0.1:8888/callback
   open_browser: True # Set to False if using a headless server environment
 
+# sync direction: spotify_to_tidal (default), tidal_to_spotify, bidirectional
+#sync_direction: spotify_to_tidal
+
+# conflict resolution policy used when sync_direction is bidirectional: spotify_wins (default), tidal_wins
+#conflict_resolution: spotify_wins
 
 # uncomment this block if you want to only sync specific playlist IDs
 #sync_playlists:
 #  - spotify_id: 1ABCDEqsABCD6EaABCDa0a
 #    tidal_id: a0b1234-0a1b-012a-abcd-a1b234c5d6d7
+#    sync_direction: tidal_to_spotify  # optional per-playlist override
 
 # uncomment this block if you want to sync all playlists in the account with some exceptions
 #excluded_playlists:
