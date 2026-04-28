@@ -2,7 +2,7 @@ from typing import TypedDict, Literal, List, Optional
 from typing_extensions import NotRequired
 
 SyncDirectionLiteral = Literal["spotify_to_tidal", "tidal_to_spotify", "bidirectional"]
-ConflictResolutionLiteral = Literal["spotify_wins", "tidal_wins"]
+ConflictResolutionLiteral = Literal["spotify_wins", "tidal_wins", "both_win"]
 
 
 class SpotifyConfig(TypedDict):

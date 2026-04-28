@@ -8,8 +8,8 @@ spotify:
 # sync direction: spotify_to_tidal (default), tidal_to_spotify, bidirectional
 #sync_direction: spotify_to_tidal
 
-# conflict resolution policy used when sync_direction is bidirectional: spotify_wins (default), tidal_wins
-#conflict_resolution: spotify_wins
+# conflict resolution policy used when sync_direction is bidirectional: both_win (default), spotify_wins, tidal_wins
+#conflict_resolution: both_win
 
 # uncomment this block if you want to only sync specific playlist IDs
 #sync_playlists:

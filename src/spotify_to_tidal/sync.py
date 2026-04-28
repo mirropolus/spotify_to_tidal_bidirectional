@@ -557,6 +557,74 @@ def detect_conflict(
     return tidal_has_unmatched and spotify_has_unmatched
 
 
+async def sync_playlist_merge(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    spotify_playlist,
+    tidal_playlist: tidalapi.Playlist | None,
+    config: dict,
+) -> None:
+    """
+    Merges both playlists: adds Tidal-only tracks to Spotify and Spotify-only tracks to Tidal.
+    Nothing is removed or overwritten — only additive changes are made.
+    """
+    playlist_name = spotify_playlist['name'] if spotify_playlist is not None else tidal_playlist.name
+
+    # Load both track lists (create missing playlist if needed)
+    if spotify_playlist is None:
+        print(f"No playlist found on Spotify corresponding to Tidal playlist: '{tidal_playlist.name}', creating new playlist")
+        spotify_playlist = await repeat_on_request_error(
+            asyncio.to_thread,
+            spotify_session.user_playlist_create,
+            spotify_session.current_user()['id'],
+            tidal_playlist.name,
+            description=tidal_playlist.description or "",
+        )
+        spotify_tracks = []
+    else:
+        spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist)
+
+    if tidal_playlist is None:
+        print(f"No playlist found on Tidal corresponding to Spotify playlist: '{spotify_playlist['name']}', creating new playlist")
+        tidal_playlist = tidal_session.user.create_playlist(spotify_playlist['name'], spotify_playlist['description'])
+        tidal_tracks = []
+    else:
+        tidal_tracks = await get_all_playlist_tracks(tidal_playlist)
+
+    # --- Push Spotify-only tracks → Tidal ---
+    populate_track_match_cache(spotify_tracks, tidal_tracks)
+    await search_new_tracks_on_tidal(tidal_session, spotify_tracks, playlist_name, config)
+    new_tidal_ids = get_tracks_for_new_tidal_playlist(spotify_tracks)
+    existing_tidal_ids = set(t.id for t in tidal_tracks)
+    tidal_ids_to_add = [tid for tid in new_tidal_ids if tid not in existing_tidal_ids]
+    if tidal_ids_to_add:
+        add_multiple_tracks_to_playlist(tidal_playlist, tidal_ids_to_add)
+    else:
+        print(f"No new tracks to add to Tidal playlist '{playlist_name}'")
+
+    # --- Push Tidal-only tracks → Spotify ---
+    await search_new_tracks_on_spotify(spotify_session, tidal_tracks, playlist_name, config)
+    existing_spotify_ids = set(t['id'] for t in spotify_tracks)
+    spotify_ids_to_add = []
+    seen: set = set()
+    for tidal_track in tidal_tracks:
+        spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
+        if spotify_id and spotify_id not in existing_spotify_ids and spotify_id not in seen:
+            spotify_ids_to_add.append(spotify_id)
+            seen.add(spotify_id)
+    if spotify_ids_to_add:
+        for i in range(0, len(spotify_ids_to_add), 100):
+            batch = spotify_ids_to_add[i:i + 100]
+            await repeat_on_request_error(
+                asyncio.to_thread,
+                spotify_session.playlist_add_items,
+                spotify_playlist['id'],
+                batch,
+            )
+    else:
+        print(f"No new tracks to add to Spotify playlist '{playlist_name}'")
+
+
 async def sync_playlist_bidirectional(
     spotify_session: spotipy.Spotify,
     tidal_session: tidalapi.Session,
@@ -571,29 +639,42 @@ async def sync_playlist_bidirectional(
     Delegates to sync_playlist (S→T) or sync_playlist_tidal_to_spotify (T→S).
     """
     # Step 1: load both track lists
-    spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist)
+    spotify_tracks = await get_tracks_from_spotify_playlist(spotify_session, spotify_playlist) if spotify_playlist is not None else []
     tidal_tracks = await get_all_playlist_tracks(tidal_playlist) if tidal_playlist is not None else []
 
     # Step 2: detect conflict
     conflict = detect_conflict(spotify_tracks, tidal_tracks)
 
     # Step 3: get conflict resolution policy
-    policy = config.get("conflict_resolution", "spotify_wins")
+    policy = config.get("conflict_resolution", "both_win")
+
+    # Determine a display name for logging (use whichever side exists)
+    playlist_name = spotify_playlist['name'] if spotify_playlist is not None else tidal_playlist.name
 
     # Step 4: log if conflict detected
     if conflict:
-        print(f"Conflict detected in playlist '{spotify_playlist['name']}': applying policy '{policy}'")
+        print(f"Conflict detected in playlist '{playlist_name}': applying policy '{policy}'")
 
     # Step 5 & 6: apply policy
-    if policy == "tidal_wins":
+    if policy == "both_win":
+        # Merge: add each side's unique tracks to the other, no overwrites
+        await sync_playlist_merge(spotify_session, tidal_session, spotify_playlist, tidal_playlist, config)
+    elif policy == "tidal_wins":
         if tidal_playlist is None:
-            # Nothing to sync from Tidal if there is no Tidal playlist
+            # No Tidal playlist exists — fall back to syncing Spotify → Tidal to create it
+            if spotify_playlist is not None:
+                await sync_playlist(spotify_session, tidal_session, spotify_playlist, None, config)
             return
         await sync_playlist_tidal_to_spotify(
             spotify_session, tidal_session, tidal_playlist, spotify_playlist, config
         )
     else:
         # Default: "spotify_wins" — sync Spotify → Tidal
+        if spotify_playlist is None:
+            # No Spotify playlist exists — fall back to syncing Tidal → Spotify to create it
+            if tidal_playlist is not None:
+                await sync_playlist_tidal_to_spotify(spotify_session, tidal_session, tidal_playlist, None, config)
+            return
         await sync_playlist(
             spotify_session, tidal_session, spotify_playlist, tidal_playlist, config
         )
@@ -655,8 +736,8 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         print("No new tracks to add to Spotify Liked Songs")
         return
 
-    for i in tqdm(range(0, len(new_liked_ids), 50), desc="Adding new tracks to Spotify Liked Songs"):
-        batch = new_liked_ids[i:i + 50]
+    for i in tqdm(range(0, len(new_liked_ids), 20), desc="Adding new tracks to Spotify Liked Songs"):
+        batch = new_liked_ids[i:i + 20]
         await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
 
 
