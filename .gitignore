@@ -34,3 +34,6 @@ dmypy.json
 
 # Visual Studio Code
 .vscode/
+
+# Kiro IDE
+.kiro/
