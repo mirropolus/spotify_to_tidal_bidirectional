@@ -32,6 +32,13 @@ venv/
 .dmypy.json
 dmypy.json
 
+# Test / coverage artifacts
+.pytest_cache/
+.hypothesis/
+htmlcov/
+.coverage
+coverage.xml
+
 # Visual Studio Code
 .vscode/
 
