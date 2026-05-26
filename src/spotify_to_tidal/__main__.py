@@ -79,9 +79,9 @@ def main():
                 # Spotify is the source of truth: only sync Spotify → Tidal
                 _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
             else:
-                # both_win (default): additive sync in both directions
-                _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
-                _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
+                # both_win (default): rebuild Spotify Liked Songs in Tidal's chronological
+                # order, keeping Spotify-only tracks, and sync Spotify-only tracks to Tidal
+                _sync.sync_favorites_bidirectional_wrapper(spotify_session, tidal_session, config)
         else:
             _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
 

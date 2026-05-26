@@ -165,6 +165,16 @@ conflict_resolution: both_win  # default — recommended for daily sync
 
 `both_win` is the safest option: your playlists only ever grow, nothing gets deleted.
 
+### Liked Songs / Favorites order (`both_win`)
+
+For **Liked Songs** ("Canciones que te gustan" / "My Collection"), `both_win` does something special: it **rebuilds** your Spotify Liked Songs in Tidal's chronological order on every run.
+
+- Tracks that exist in Tidal are placed first, ordered oldest-to-newest, so the most recently added Tidal track appears at the top of Spotify's "Recently Added" view.
+- Tracks that only exist in Spotify (no Tidal equivalent) are kept and appended after, preserving their relative order.
+- Any Spotify-only tracks are also added to Tidal favorites.
+
+This means Spotify's "Recently Added" order will mirror Tidal's after each sync run. The operation temporarily removes all Liked Songs and re-adds them in the correct sequence — this is necessary because Spotify does not allow reordering or setting custom timestamps via the API.
+
 ---
 
 ## Per-playlist sync direction

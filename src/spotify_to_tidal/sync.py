@@ -751,6 +751,98 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
 
 
+async def sync_favorites_bidirectional(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict) -> None:
+    """
+    Bidirectional favorites sync with order rebuild (both_win policy).
+
+    Rebuilds Spotify Liked Songs to match Tidal's chronological order while
+    preserving any Spotify-only tracks (tracks in Spotify but not in Tidal).
+
+    Order logic:
+    - Tidal-matched tracks are placed first, oldest-first, so the most recently
+      added Tidal track ends up at the top of Spotify's "Recently Added" view.
+    - Spotify-only tracks (no Tidal equivalent) are appended after, preserving
+      their relative order among themselves.
+
+    This requires removing all Spotify Liked Songs and re-adding them in the
+    correct sequence, since Spotify does not allow reordering or custom timestamps.
+
+    Also syncs any Spotify-only tracks to Tidal favorites (additive, no removals).
+    """
+    print("Loading favorite tracks from Tidal (oldest first)")
+    tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE', order_direction='ASC')
+
+    print("Loading existing Liked Songs from Spotify")
+    _get_liked_tracks = lambda offset: spotify_session.current_user_saved_tracks(offset=offset)
+    # _fetch_all_from_spotify_in_chunks returns newest-first; reverse to get oldest-first
+    existing_spotify_liked = await repeat_on_request_error(_fetch_all_from_spotify_in_chunks, _get_liked_tracks)
+    existing_spotify_liked_oldest_first = list(reversed(existing_spotify_liked))
+
+    existing_liked_ids = {t['id'] for t in existing_spotify_liked if t}
+
+    # --- Step 1: sync Spotify-only tracks → Tidal (additive) ---
+    print("Loading existing favorite tracks from Tidal")
+    old_tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+    populate_track_match_cache(existing_spotify_liked_oldest_first, old_tidal_tracks)
+    await search_new_tracks_on_tidal(tidal_session, existing_spotify_liked_oldest_first, "Favorites", config)
+    existing_tidal_ids = {t.id for t in old_tidal_tracks}
+    new_tidal_ids = [
+        track_match_cache.get(t['id'])
+        for t in existing_spotify_liked_oldest_first
+        if track_match_cache.get(t['id']) and track_match_cache.get(t['id']) not in existing_tidal_ids
+    ]
+    if new_tidal_ids:
+        for tidal_id in tqdm(new_tidal_ids, desc="Adding new tracks to Tidal favorites"):
+            tidal_session.user.favorites.add_track(tidal_id)
+    else:
+        print("No new tracks to add to Tidal favorites")
+
+    # --- Step 2: search Spotify for all Tidal tracks ---
+    await search_new_tracks_on_spotify(spotify_session, tidal_tracks, "Favorites", config)
+
+    # --- Step 3: build the ordered final list ---
+    # Part A: Tidal-matched tracks in Tidal's chronological order (oldest first)
+    tidal_matched_spotify_ids = []
+    seen: set = set()
+    for tidal_track in tidal_tracks:
+        spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
+        if spotify_id and spotify_id not in seen:
+            tidal_matched_spotify_ids.append(spotify_id)
+            seen.add(spotify_id)
+
+    # Part B: Spotify-only tracks (not matched from Tidal), in their original relative order
+    spotify_only_ids = [
+        t['id'] for t in existing_spotify_liked_oldest_first
+        if t['id'] not in seen
+    ]
+
+    # Final order: Tidal-matched (oldest→newest) then Spotify-only
+    # When added oldest-first, the last item added gets the most recent timestamp
+    # and appears at the top of Spotify's "Recently Added" view.
+    final_ordered_ids = tidal_matched_spotify_ids + spotify_only_ids
+
+    if not final_ordered_ids:
+        print("No tracks to sync to Spotify Liked Songs")
+        return
+
+    print(f"Rebuilding Spotify Liked Songs: {len(tidal_matched_spotify_ids)} Tidal-matched + "
+          f"{len(spotify_only_ids)} Spotify-only = {len(final_ordered_ids)} total tracks")
+
+    # --- Step 4: remove all current Spotify Liked Songs ---
+    print("Removing all existing Spotify Liked Songs (will be re-added in correct order)...")
+    all_current_ids = [t['id'] for t in existing_spotify_liked if t]
+    for i in tqdm(range(0, len(all_current_ids), 50), desc="Removing Spotify Liked Songs"):
+        batch = all_current_ids[i:i + 50]
+        await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_delete, batch)
+
+    # --- Step 5: re-add in correct order (oldest first) ---
+    for i in tqdm(range(0, len(final_ordered_ids), 20), desc="Re-adding tracks to Spotify Liked Songs"):
+        batch = final_ordered_ids[i:i + 20]
+        await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
+
+    print(f"Spotify Liked Songs rebuilt successfully in Tidal chronological order.")
+
+
 def sync_playlists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
   for spotify_playlist, tidal_playlist in playlists:
     # sync the spotify playlist to tidal
@@ -771,6 +863,9 @@ def sync_playlists_bidirectional_wrapper(spotify_session: spotipy.Spotify, tidal
 
 def sync_favorites_tidal_to_spotify_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
     asyncio.run(sync_favorites_tidal_to_spotify(spotify_session=spotify_session, tidal_session=tidal_session, config=config))
+
+def sync_favorites_bidirectional_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
+    asyncio.run(sync_favorites_bidirectional(spotify_session=spotify_session, tidal_session=tidal_session, config=config))
 
 def get_tidal_playlists_wrapper(tidal_session: tidalapi.Session) -> Mapping[str, tidalapi.Playlist]:
     tidal_playlists = asyncio.run(get_all_playlists(tidal_session.user))
