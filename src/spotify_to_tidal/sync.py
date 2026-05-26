@@ -831,8 +831,8 @@ async def sync_favorites_bidirectional(spotify_session: spotipy.Spotify, tidal_s
     # --- Step 4: remove all current Spotify Liked Songs ---
     print("Removing all existing Spotify Liked Songs (will be re-added in correct order)...")
     all_current_ids = [t['id'] for t in existing_spotify_liked if t]
-    for i in tqdm(range(0, len(all_current_ids), 50), desc="Removing Spotify Liked Songs"):
-        batch = all_current_ids[i:i + 50]
+    for i in tqdm(range(0, len(all_current_ids), 20), desc="Removing Spotify Liked Songs"):
+        batch = all_current_ids[i:i + 20]
         await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_delete, batch)
 
     # --- Step 5: re-add in correct order (oldest first) ---
