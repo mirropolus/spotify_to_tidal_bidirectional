@@ -71,8 +71,17 @@ def main():
         if sync_direction == "tidal_to_spotify":
             _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
         elif sync_direction == "bidirectional":
-            _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
-            _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
+            conflict_resolution = config.get("conflict_resolution", "both_win")
+            if conflict_resolution == "tidal_wins":
+                # Tidal is the source of truth: only sync Tidal → Spotify
+                _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
+            elif conflict_resolution == "spotify_wins":
+                # Spotify is the source of truth: only sync Spotify → Tidal
+                _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
+            else:
+                # both_win (default): additive sync in both directions
+                _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
+                _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
         else:
             _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
 

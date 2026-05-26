@@ -714,9 +714,16 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
     """
     Reads Tidal favorites, searches for Spotify equivalents,
     and adds matched tracks to Spotify Liked Songs (skipping duplicates).
+
+    Tracks are fetched from Tidal oldest-first (order='DATE', order_direction='ASC')
+    and added to Spotify in that same order. Because Spotify's "Recently Added" view
+    shows the last-added track at the top, adding oldest-first means the newest Tidal
+    track ends up at the top of Liked Songs — preserving the expected "last added" order.
     """
     print("Loading favorite tracks from Tidal")
-    tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+    # Fetch oldest-first so we add in chronological order; the last batch added
+    # will be the most recent, landing at the top of Spotify's "Recently Added" view.
+    tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE', order_direction='ASC')
 
     print("Loading existing Liked Songs from Spotify")
     _get_liked_tracks = lambda offset: spotify_session.current_user_saved_tracks(offset=offset)
@@ -726,6 +733,7 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
 
     await search_new_tracks_on_spotify(spotify_session, tidal_tracks, "Favorites", config)
 
+    # Build the list of new IDs in oldest-first order (preserves Tidal's chronological order)
     new_liked_ids = []
     for tidal_track in tidal_tracks:
         spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
@@ -736,6 +744,8 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         print("No new tracks to add to Spotify Liked Songs")
         return
 
+    # Add in batches of 20, oldest-first — the last batch added gets the most recent
+    # timestamp, so it appears at the top of "Recently Added" in Spotify.
     for i in tqdm(range(0, len(new_liked_ids), 20), desc="Adding new tracks to Spotify Liked Songs"):
         batch = new_liked_ids[i:i + 20]
         await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
