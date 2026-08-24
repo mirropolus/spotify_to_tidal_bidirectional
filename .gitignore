@@ -5,6 +5,7 @@ config.yaml
 .session.yml
 songs not found.txt
 favorites_audit*.csv
+favorites_dry_run*.csv
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -139,10 +139,119 @@ def match(tidal_track, spotify_track) -> bool:
         and artist_match(tidal_track, spotify_track)
     )
 
+
+def _favorite_datetime(track) -> datetime.datetime | None:
+    values = [
+        value for value in (
+            getattr(track, "date_added", None),
+            getattr(track, "user_date_added", None),
+        )
+        if isinstance(value, datetime.datetime)
+    ]
+    if not values:
+        return None
+
+    def utc(value: datetime.datetime) -> datetime.datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return value.replace(tzinfo=datetime.timezone.utc)
+        return value.astimezone(datetime.timezone.utc)
+
+    return min(values, key=utc)
+
+
+def deduplicate_tidal_favorites(tidal_tracks: Sequence) -> list:
+    """Return one Tidal favorite per provider ID, retaining the earliest date."""
+    groups: dict[str, list] = {}
+    order: list[str] = []
+    for index, track in enumerate(tidal_tracks):
+        raw_id = getattr(track, "id", None)
+        key = str(raw_id) if raw_id not in {None, ""} else f"__missing_id_{index}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(track)
+
+    output = []
+    for key in order:
+        tracks = groups[key]
+
+        def timestamp_key(track) -> tuple[bool, datetime.datetime]:
+            value = _favorite_datetime(track)
+            if value is None:
+                return True, datetime.datetime.max.replace(
+                    tzinfo=datetime.timezone.utc,
+                )
+            if value.tzinfo is None or value.utcoffset() is None:
+                value = value.replace(tzinfo=datetime.timezone.utc)
+            else:
+                value = value.astimezone(datetime.timezone.utc)
+            return False, value
+
+        representative = min(
+            tracks,
+            key=timestamp_key,
+        )
+        output.append(representative)
+    return output
+
+
+def deduplicate_spotify_saved_items(spotify_saved_items: Sequence[dict]) -> list[dict]:
+    """Return one Spotify saved item per actual Liked Songs track ID."""
+    output = []
+    seen = set()
+    for item in spotify_saved_items:
+        track = item.get("track")
+        spotify_id = track.get("id") if track else None
+        if not spotify_id or spotify_id in seen:
+            continue
+        seen.add(spotify_id)
+        output.append(item)
+    return output
+
+
+def _safe_favorite_match(tidal_track, spotify_track: dict) -> bool:
+    try:
+        return match(tidal_track, spotify_track)
+    except (AttributeError, KeyError, TypeError):
+        return False
+
+
+def semantically_unmatched_tidal_favorites(
+    tidal_tracks: Sequence,
+    spotify_saved_items: Sequence[dict],
+) -> list:
+    spotify_tracks = [
+        item["track"] for item in spotify_saved_items
+        if item.get("track") is not None
+    ]
+    return [
+        track for track in tidal_tracks
+        if not any(_safe_favorite_match(track, spotify) for spotify in spotify_tracks)
+    ]
+
+
+def semantically_unmatched_spotify_favorites(
+    spotify_saved_items: Sequence[dict],
+    tidal_tracks: Sequence,
+) -> list[dict]:
+    return [
+        item for item in spotify_saved_items
+        if not any(
+            _safe_favorite_match(tidal, item["track"])
+            for tidal in tidal_tracks
+        )
+    ]
+
 def test_album_similarity(spotify_album, tidal_album, threshold=0.6):
     return SequenceMatcher(None, simple(spotify_album['name']), simple(tidal_album.name)).ratio() >= threshold and artist_match(tidal_album, spotify_album)
 
-async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Session) -> tidalapi.Track | None:
+async def tidal_search(
+    spotify_track,
+    rate_limiter,
+    tidal_session: tidalapi.Session,
+    *,
+    record_failure: bool = True,
+) -> tidalapi.Track | None:
     def _search_for_track_in_album():
         # search for album name and first album artist
         if 'album' in spotify_track and 'artists' in spotify_track['album'] and len(spotify_track['album']['artists']):
@@ -156,7 +265,8 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
                         continue
                     track = album_tracks[spotify_track['track_number'] - 1]
                     if match(track, spotify_track):
-                        failure_cache.remove_match_failure(spotify_track['id'])
+                        if record_failure:
+                            failure_cache.remove_match_failure(spotify_track['id'])
                         return track
 
     def _search_for_standalone_track():
@@ -164,7 +274,8 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
         query = simple(spotify_track['name']) + ' ' + simple(spotify_track['artists'][0]['name'])
         for track in tidal_session.search(query, models=[tidalapi.media.Track])['tracks']:
             if match(track, spotify_track):
-                failure_cache.remove_match_failure(spotify_track['id'])
+                if record_failure:
+                    failure_cache.remove_match_failure(spotify_track['id'])
                 return track
     await rate_limiter.acquire()
     album_search = await asyncio.to_thread( _search_for_track_in_album )
@@ -176,7 +287,8 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
         return track_search
 
     # if none of the search modes succeeded then store the track id to the failure cache
-    failure_cache.cache_match_failure(spotify_track['id'])
+    if record_failure:
+        failure_cache.cache_match_failure(spotify_track['id'])
 
 async def spotify_search(
     tidal_track: tidalapi.Track,
@@ -793,16 +905,24 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
     def get_new_tidal_favorites() -> List[int]:
         existing_favorite_ids = set([track.id for track in old_tidal_tracks])
         new_ids = []
+        seen_ids = set()
         for spotify_track in spotify_tracks:
             match_id = track_match_cache.get(spotify_track['id'])
-            if match_id and not match_id in existing_favorite_ids:
+            if (
+                match_id
+                and match_id not in existing_favorite_ids
+                and match_id not in seen_ids
+            ):
                 new_ids.append(match_id)
+                seen_ids.add(match_id)
         return new_ids
 
     print("Loading favorite tracks from Spotify")
     spotify_tracks = await get_tracks_from_spotify_favorites()
+    spotify_tracks = list({track['id']: track for track in spotify_tracks}.values())
     print("Loading existing favorite tracks from Tidal")
     old_tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+    old_tidal_tracks = deduplicate_tidal_favorites(old_tidal_tracks)
     populate_track_match_cache(spotify_tracks, old_tidal_tracks)
     await search_new_tracks_on_tidal(tidal_session, spotify_tracks, "Favorites", config)
     new_tidal_favorite_ids = get_new_tidal_favorites()
@@ -826,12 +946,14 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         order='DATE',
         order_direction='ASC',
     )
+    tidal_tracks = deduplicate_tidal_favorites(tidal_tracks)
 
     print("Loading existing Liked Songs from Spotify")
     existing_spotify_liked = await repeat_on_request_error(
         get_spotify_saved_track_items,
         spotify_session,
     )
+    existing_spotify_liked = deduplicate_spotify_saved_items(existing_spotify_liked)
 
     existing_liked_ids = {
         item['track']['id']
@@ -839,11 +961,20 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         if item.get('track') and item['track'].get('id')
     }
 
-    await search_new_tracks_on_spotify(spotify_session, tidal_tracks, "Favorites", config)
+    tidal_tracks_to_search = semantically_unmatched_tidal_favorites(
+        tidal_tracks,
+        existing_spotify_liked,
+    )
+    await search_new_tracks_on_spotify(
+        spotify_session,
+        tidal_tracks_to_search,
+        "Favorites",
+        config,
+    )
 
     new_likes: list[tuple[str, datetime.datetime]] = []
     queued_ids: set[str] = set()
-    for tidal_track in tidal_tracks:
+    for tidal_track in tidal_tracks_to_search:
         spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
         if (
             not spotify_id
@@ -852,10 +983,7 @@ async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tida
         ):
             continue
 
-        date_added = (
-            getattr(tidal_track, "date_added", None)
-            or getattr(tidal_track, "user_date_added", None)
-        )
+        date_added = _favorite_datetime(tidal_track)
         if not isinstance(date_added, datetime.datetime):
             logger.warning(
                 "Skipping Tidal favorite %s (%s): date_added is missing or invalid; "

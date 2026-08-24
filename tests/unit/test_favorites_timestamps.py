@@ -20,14 +20,27 @@ UTC = datetime.timezone.utc
 def tidal_track(track_id, date_added):
     return SimpleNamespace(
         id=track_id,
+        isrc=f"ISRC-{track_id}",
         name=f"Tidal track {track_id}",
+        duration=200,
+        artists=[SimpleNamespace(name="Artist")],
+        version=None,
         date_added=date_added,
         user_date_added=date_added,
     )
 
 
 def saved_item(spotify_id, added_at="2026-01-01T00:00:00Z"):
-    return {"added_at": added_at, "track": {"id": spotify_id}}
+    return {
+        "added_at": added_at,
+        "track": {
+            "id": spotify_id,
+            "name": f"Tidal track {spotify_id}",
+            "duration_ms": 200000,
+            "artists": [{"name": "Artist"}],
+            "external_ids": {"isrc": f"ISRC-{spotify_id}"},
+        },
+    }
 
 
 def test_regression_old_tidal_favorite_is_saved_with_old_timestamp(mocker):
@@ -93,6 +106,103 @@ def test_existing_spotify_like_is_untouched(mocker):
 
     spotify._put.assert_not_called()
     spotify.current_user_saved_tracks_add.assert_not_called()
+
+
+def test_existing_semantic_like_with_different_id_is_untouched(mocker):
+    track = tidal_track("tidal-1", datetime.datetime(2021, 1, 1, tzinfo=UTC))
+    existing = saved_item("spotify-existing")
+    existing["track"]["external_ids"]["isrc"] = track.isrc
+    existing["track"]["name"] = track.name
+    spotify = MagicMock()
+    tidal = SimpleNamespace(user=SimpleNamespace(favorites=MagicMock()))
+
+    mocker.patch(
+        "spotify_to_tidal.sync.get_all_favorites",
+        new=mocker.AsyncMock(return_value=[track]),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.get_spotify_saved_track_items",
+        new=mocker.AsyncMock(return_value=[existing]),
+    )
+    search = mocker.patch(
+        "spotify_to_tidal.sync.search_new_tracks_on_spotify",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.reverse_track_match_cache.get",
+        return_value="spotify-alternative-catalog-id",
+    )
+
+    asyncio.run(sync_favorites_tidal_to_spotify(spotify, tidal, {}))
+
+    search.assert_awaited_once_with(spotify, [], "Favorites", {})
+    spotify._put.assert_not_called()
+    spotify.current_user_saved_tracks_add.assert_not_called()
+
+
+def test_duplicate_tidal_favorite_uses_earliest_date_once(mocker):
+    later = tidal_track("tidal-1", datetime.datetime(2025, 1, 1, tzinfo=UTC))
+    earlier = tidal_track("tidal-1", datetime.datetime(2021, 1, 1, tzinfo=UTC))
+    spotify = MagicMock()
+    tidal = SimpleNamespace(user=SimpleNamespace(favorites=MagicMock()))
+
+    mocker.patch(
+        "spotify_to_tidal.sync.get_all_favorites",
+        new=mocker.AsyncMock(return_value=[later, earlier]),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.get_spotify_saved_track_items",
+        new=mocker.AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.search_new_tracks_on_spotify",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.reverse_track_match_cache.get",
+        return_value="spotify-1",
+    )
+
+    asyncio.run(sync_favorites_tidal_to_spotify(spotify, tidal, {}))
+
+    payload = spotify._put.call_args.kwargs["payload"]
+    assert payload == {
+        "timestamped_ids": [{
+            "id": "spotify-1",
+            "added_at": "2021-01-01T00:00:00.000Z",
+        }]
+    }
+
+
+def test_duplicate_tidal_favorite_compares_naive_and_aware_dates_safely(mocker):
+    later_naive = tidal_track("tidal-1", datetime.datetime(2025, 1, 1))
+    earlier_aware = tidal_track(
+        "tidal-1",
+        datetime.datetime(2021, 1, 1, tzinfo=UTC),
+    )
+    spotify = MagicMock()
+    tidal = SimpleNamespace(user=SimpleNamespace(favorites=MagicMock()))
+    mocker.patch(
+        "spotify_to_tidal.sync.get_all_favorites",
+        new=mocker.AsyncMock(return_value=[later_naive, earlier_aware]),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.get_spotify_saved_track_items",
+        new=mocker.AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.search_new_tracks_on_spotify",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch(
+        "spotify_to_tidal.sync.reverse_track_match_cache.get",
+        return_value="spotify-1",
+    )
+
+    asyncio.run(sync_favorites_tidal_to_spotify(spotify, tidal, {}))
+
+    payload = spotify._put.call_args.kwargs["payload"]
+    assert payload["timestamped_ids"][0]["added_at"] == "2021-01-01T00:00:00.000Z"
 
 
 def test_timestamped_saves_use_spotify_batch_limit():

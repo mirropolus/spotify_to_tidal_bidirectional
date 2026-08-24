@@ -204,6 +204,37 @@ audit_timestamp_cluster_min_delta_hours: 24
 The report is diagnostic only. It does not remove/re-add likes or repair dates.
 Rows with `match_ambiguity` must not be used as automatic repair instructions.
 
+### Preview a favorites sync
+
+Generate a read-only synchronization plan before allowing any account writes:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --dry-run \
+  --sync-favorites \
+  --sync-direction bidirectional
+```
+
+The default plan is `favorites_dry_run.csv`; choose another path with
+`--dry-run-output`. The command is favorites-only, requests only Spotify read
+scopes, performs catalog searches without modifying match/failure caches, and
+never calls favorite, like, playlist, or delete endpoints.
+
+Plan actions are:
+
+| Action | Meaning |
+|---|---|
+| `would_add` | Semantically absent from the destination and a safe catalog candidate was found |
+| `skip_existing` | Defensive exact-ID check found the candidate already saved |
+| `blocked` | A required historical timestamp is missing |
+| `match_failed` | No safe destination catalog match was found |
+
+Normal Tidal → Spotify favorites sync uses the same safety boundary: it
+deduplicates Tidal provider IDs, keeps the earliest historical date, and does
+not search or add a different Spotify version when any existing Liked Songs
+track already matches the recording. The dry-run plan remains advisory and
+does not repair historical timestamps.
+
 ---
 
 ## Bidirectional sync
@@ -302,10 +333,11 @@ CSVs are ignored by Git. The workflow grants only read access to repository
 contents and does not upload session files or caches.
 
 After merging, add the secrets and use **Run workflow** for the first real
-production execution. Review its logs and the favorites audit before enabling
-any recurring execution. The daily `schedule` trigger is intentionally omitted
-for now and should be added in a later change only after that manual run has
-been validated. Playlist synchronization should remain out of this workflow
+production execution—but only after a local bidirectional `--dry-run` CSV has
+been reviewed and approved. Review its logs and the favorites audit before
+enabling any recurring execution. The daily `schedule` trigger is intentionally
+omitted for now and should be added in a later change only after that manual run
+has been validated. Playlist synchronization should remain out of this workflow
 until it is reviewed separately.
 
 ---

@@ -5,6 +5,7 @@ import sys
 from . import sync as _sync
 from . import auth as _auth
 from . import audit as _audit
+from . import dry_run as _dry_run
 
 def main():
     parser = argparse.ArgumentParser()
@@ -22,6 +23,16 @@ def main():
         help='CSV path for --audit-favorites (default: favorites_audit.csv)',
     )
     parser.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='write a read-only favorites sync plan without modifying either account',
+    )
+    parser.add_argument(
+        '--dry-run-output',
+        default='favorites_dry_run.csv',
+        help='CSV path for --dry-run (default: favorites_dry_run.csv)',
+    )
+    parser.add_argument(
         '--sync-direction',
         dest='sync_direction',
         choices=['spotify_to_tidal', 'tidal_to_spotify', 'bidirectional'],
@@ -32,6 +43,9 @@ def main():
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f) or {}
+
+    if args.audit_favorites and args.dry_run:
+        sys.exit("Choose either --audit-favorites or --dry-run, not both")
 
     if args.audit_favorites:
         print("Opening read-only Spotify session")
@@ -48,6 +62,28 @@ def main():
             tidal_session,
             config,
             args.audit_output,
+        )
+        return
+
+    if args.dry_run:
+        if args.uri:
+            sys.exit("--dry-run is favorites-only and cannot be combined with --uri")
+        direction = _sync.resolve_sync_direction(config, args.sync_direction)
+        print("Opening read-only Spotify session")
+        spotify_session = _auth.open_spotify_session(
+            config['spotify'],
+            sync_direction="spotify_to_tidal",
+        )
+        print("Opening Tidal session")
+        tidal_session = _auth.open_tidal_session()
+        if not tidal_session.check_login():
+            sys.exit("Could not connect to Tidal")
+        _dry_run.favorites_dry_run_wrapper(
+            spotify_session,
+            tidal_session,
+            config,
+            direction,
+            args.dry_run_output,
         )
         return
 
