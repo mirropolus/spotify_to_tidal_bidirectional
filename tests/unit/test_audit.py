@@ -5,7 +5,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from spotify_to_tidal import __main__
-from spotify_to_tidal.audit import audit_favorites, build_favorites_audit_rows
+from spotify_to_tidal.audit import (
+    audit_favorites,
+    build_favorites_audit_rows,
+    collect_favorites_audit_rows_from_tracks,
+)
 from spotify_to_tidal.sync import spotify_search
 
 
@@ -190,3 +194,34 @@ def test_audit_catalog_search_does_not_modify_failure_cache(mocker):
     assert result["id"] == "spotify-catalog"
     remove_failure.assert_not_called()
     cache_failure.assert_not_called()
+
+
+def test_web_audit_handles_tidal_track_without_included_artist_metadata():
+    track = tidal_track(
+        "tidal-no-artist",
+        "ISRCNOARTIST",
+        datetime.datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    track.artists = []
+    spotify_session = MagicMock()
+    spotify_session.current_user_saved_tracks.return_value = {
+        "items": [],
+        "next": None,
+        "limit": 50,
+        "total": 0,
+    }
+    spotify_session.search.return_value = {"tracks": {"items": []}}
+
+    rows = asyncio.run(
+        collect_favorites_audit_rows_from_tracks(
+            spotify_session,
+            [track],
+            {},
+        )
+    )
+
+    assert rows[0]["status"] == "match_failed"
+    spotify_session.search.assert_called_once_with(
+        q="isrc:ISRCNOARTIST",
+        type="track",
+    )

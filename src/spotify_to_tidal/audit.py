@@ -38,6 +38,10 @@ AUDIT_FIELDS = [
 ]
 
 
+class AuditStageError(RuntimeError):
+    """A sanitized audit-stage failure safe to display without provider data."""
+
+
 def _tidal_date_added(track) -> datetime.datetime | None:
     value = (
         getattr(track, "date_added", None)
@@ -246,14 +250,45 @@ async def _catalog_matches_for_unmatched(
                 semaphore.release()
 
     limiter_task = asyncio.create_task(release_tokens())
-    try:
-        results = await asyncio.gather(*[
-            repeat_on_request_error(
-                spotify_search,
+
+    async def audit_spotify_search(track):
+        has_text_metadata = (
+            getattr(track, "name", None)
+            and any(getattr(artist, "name", None) for artist in getattr(track, "artists", []))
+        )
+        if has_text_metadata:
+            return await spotify_search(
                 track,
                 semaphore,
                 spotify_session,
                 record_failure=False,
+            )
+
+        # Official OpenAPI can occasionally omit an included artist resource.
+        # An ISRC-only lookup remains useful and avoids indexing a missing artist.
+        isrc = getattr(track, "isrc", None)
+        if not isrc:
+            return None
+        await semaphore.acquire()
+        results = await asyncio.to_thread(
+            spotify_session.search,
+            q=f"isrc:{isrc}",
+            type="track",
+        )
+        return next(
+            (
+                candidate for candidate in results.get("tracks", {}).get("items", [])
+                if candidate.get("id")
+                and candidate.get("external_ids", {}).get("isrc") == isrc
+            ),
+            None,
+        )
+
+    try:
+        results = await asyncio.gather(*[
+            repeat_on_request_error(
+                audit_spotify_search,
+                track,
             )
             for track in searchable_tracks
         ])
@@ -321,24 +356,44 @@ async def collect_favorites_audit_rows_from_tracks(
 ) -> list[dict]:
     """Audit a supplied read-only Tidal collection against Spotify Liked Songs."""
     print("Loading Liked Songs from Spotify (read-only audit)")
-    spotify_items = await repeat_on_request_error(
-        get_spotify_saved_track_items,
-        spotify_session,
-    )
+    try:
+        spotify_items = await repeat_on_request_error(
+            get_spotify_saved_track_items,
+            spotify_session,
+        )
+    except Exception as exc:
+        raise AuditStageError(
+            f"Spotify Liked Songs loading failed ({type(exc).__name__})"
+        ) from exc
 
-    _, tidal_unmatched, _ = _pair_saved_favorites(tidal_tracks, spotify_items)
-    catalog_matches = await _catalog_matches_for_unmatched(
-        spotify_session,
-        tidal_unmatched,
-        config,
-    )
-    return build_favorites_audit_rows(
-        tidal_tracks,
-        spotify_items,
-        catalog_matches,
-        mismatch_days=config.get("audit_timestamp_mismatch_days", 30),
-        cluster_size=config.get("audit_timestamp_cluster_size", 3),
-    )
+    try:
+        _, tidal_unmatched, _ = _pair_saved_favorites(tidal_tracks, spotify_items)
+    except Exception as exc:
+        raise AuditStageError(
+            f"Favorites pairing failed ({type(exc).__name__})"
+        ) from exc
+    try:
+        catalog_matches = await _catalog_matches_for_unmatched(
+            spotify_session,
+            tidal_unmatched,
+            config,
+        )
+    except Exception as exc:
+        raise AuditStageError(
+            f"Spotify catalog matching failed ({type(exc).__name__})"
+        ) from exc
+    try:
+        return build_favorites_audit_rows(
+            tidal_tracks,
+            spotify_items,
+            catalog_matches,
+            mismatch_days=config.get("audit_timestamp_mismatch_days", 30),
+            cluster_size=config.get("audit_timestamp_cluster_size", 3),
+        )
+    except Exception as exc:
+        raise AuditStageError(
+            f"Audit report construction failed ({type(exc).__name__})"
+        ) from exc
 
 
 def audit_favorites_wrapper(

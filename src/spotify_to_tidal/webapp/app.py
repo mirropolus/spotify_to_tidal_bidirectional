@@ -26,8 +26,13 @@ from spotipy.cache_handler import MemoryCacheHandler
 from spotipy.oauth2 import SpotifyPKCE
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ..audit import AUDIT_FIELDS, collect_favorites_audit_rows_from_tracks
+from ..audit import (
+    AUDIT_FIELDS,
+    AuditStageError,
+    collect_favorites_audit_rows_from_tracks,
+)
 from .tidal_auth import (
+    TidalAPIError,
     TidalOpenAPIClient,
     build_authorization_url,
     exchange_authorization_code,
@@ -417,6 +422,12 @@ def create_app(
                 datetime.timezone.utc
             ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
             state.notice = "Audit completed. No library changes were made."
+        except TidalAPIError as exc:
+            state.clear_report()
+            state.error = f"{exc}. No library changes were made."
+        except AuditStageError as exc:
+            state.clear_report()
+            state.error = f"{exc}. No library changes were made."
         except Exception:
             state.clear_report()
             state.error = "The audit could not be completed. No library changes were made."

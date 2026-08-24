@@ -14,6 +14,7 @@ from spotify_to_tidal.webapp.app import (
     create_app,
 )
 from spotify_to_tidal.webapp.tidal_auth import TidalCredentials
+from spotify_to_tidal.webapp.tidal_auth import TidalAPIError
 
 
 def configured_settings(**overrides):
@@ -317,6 +318,24 @@ def test_web_audit_requires_csrf():
     client, _, _ = connected_client()
     response = client.post("/audit", data={"csrf_token": "wrong"})
     assert response.status_code == 403
+
+
+def test_web_audit_reports_safe_tidal_stage_error(mocker):
+    client, _, state = connected_client()
+    state.tidal_client.favorite_tracks = mocker.AsyncMock(
+        side_effect=TidalAPIError("Tidal collection pagination failed")
+    )
+
+    response = client.post(
+        "/audit",
+        data={"csrf_token": state.csrf_token},
+        follow_redirects=False,
+    )
+    home = client.get("/")
+
+    assert response.status_code == 303
+    assert "Tidal collection pagination failed" in home.text
+    assert "No library changes were made" in home.text
 
 
 def test_web_app_exposes_no_sync_or_delete_library_routes():
