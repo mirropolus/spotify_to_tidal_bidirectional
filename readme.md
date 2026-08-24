@@ -212,13 +212,20 @@ Generate a read-only synchronization plan before allowing any account writes:
 python3.11 -m spotify_to_tidal \
   --dry-run \
   --sync-favorites \
-  --sync-direction bidirectional
+  --sync-direction bidirectional \
+  --dry-run-audit-input favorites_audit.csv
 ```
 
 The default plan is `favorites_dry_run.csv`; choose another path with
 `--dry-run-output`. The command is favorites-only, requests only Spotify read
 scopes, performs catalog searches without modifying match/failure caches, and
 never calls favorite, like, playlist, or delete endpoints.
+
+The optional `--dry-run-audit-input` cross-checks current candidates against a
+previous read-only audit. Primary saved IDs and many-to-many matched-ID columns
+are accepted; catalog-only candidate IDs are deliberately not treated as saved
+library entries. A contradictory prior match blocks the proposed action as
+`audit_conflict`.
 
 Plan actions are:
 
@@ -228,6 +235,18 @@ Plan actions are:
 | `skip_existing` | Defensive exact-ID check found the candidate already saved |
 | `blocked` | A required historical timestamp is missing |
 | `match_failed` | No safe destination catalog match was found |
+| `duplicate_target` | Another source row resolves to the same destination ID; only the primary row can remain `would_add` |
+| `origin_suspect` | A Spotify source timestamp belongs to a dense addition cluster and may have been imported by the historical bug |
+| `audit_conflict` | A prior audit indicates that the recording or exact destination ID was already present |
+| `metadata_review` | The candidate matched by title, artist and duration rather than exact ISRC and requires manual review |
+
+The CSV includes source and destination ISRC, artist, title and duration,
+`match_method` (`exact_isrc`, `metadata`, or `catalog_unverified`), cluster size,
+safety flags, audit references and coalesced source IDs. Only `would_add` rows
+represent unblocked candidate writes. `dry_run_origin_cluster_size` controls the
+minimum same-UTC-minute Spotify cluster size and defaults to the audit cluster
+threshold (3). Cluster and audit checks are intentionally conservative: review
+their rows manually rather than treating them as confirmed errors.
 
 Normal Tidal → Spotify favorites sync uses the same safety boundary: it
 deduplicates Tidal provider IDs, keeps the earliest historical date, and does

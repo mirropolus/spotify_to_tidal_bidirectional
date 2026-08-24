@@ -1,5 +1,6 @@
 import yaml
 import argparse
+from pathlib import Path
 import sys
 
 from . import sync as _sync
@@ -31,6 +32,10 @@ def main():
         '--dry-run-output',
         default='favorites_dry_run.csv',
         help='CSV path for --dry-run (default: favorites_dry_run.csv)',
+    )
+    parser.add_argument(
+        '--dry-run-audit-input',
+        help='optional prior favorites audit CSV used to block contradictory plan rows',
     )
     parser.add_argument(
         '--sync-direction',
@@ -68,6 +73,19 @@ def main():
     if args.dry_run:
         if args.uri:
             sys.exit("--dry-run is favorites-only and cannot be combined with --uri")
+        if (
+            args.dry_run_audit_input
+            and not Path(args.dry_run_audit_input).is_file()
+        ):
+            sys.exit(
+                "--dry-run-audit-input does not exist or is not a file: "
+                f"{args.dry_run_audit_input}"
+            )
+        if args.dry_run_audit_input:
+            try:
+                _dry_run.load_audit_crosscheck(args.dry_run_audit_input)
+            except (OSError, ValueError) as exc:
+                sys.exit(f"Invalid --dry-run-audit-input: {exc}")
         direction = _sync.resolve_sync_direction(config, args.sync_direction)
         print("Opening read-only Spotify session")
         spotify_session = _auth.open_spotify_session(
@@ -84,6 +102,7 @@ def main():
             config,
             direction,
             args.dry_run_output,
+            args.dry_run_audit_input,
         )
         return
 
