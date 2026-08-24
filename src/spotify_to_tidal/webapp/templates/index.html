@@ -110,6 +110,7 @@
         </div>
         <div class="metrics">
           <div><strong>{{ audit_counts.get('matched', 0) }}</strong><span>Matched</span></div>
+          <div><strong>{{ audit_counts.get('matched_equivalent', 0) }}</strong><span>Equivalent IDs</span></div>
           <div><strong>{{ audit_counts.get('tidal_only', 0) }}</strong><span>Tidal only</span></div>
           <div><strong>{{ audit_counts.get('spotify_only', 0) }}</strong><span>Spotify only</span></div>
           <div><strong>{{ audit_counts.get('timestamp_mismatch', 0) }}</strong><span>Timestamp alerts</span></div>
@@ -134,7 +135,7 @@
               <strong>{{ row.artist }} — {{ row.title }}</strong>
               <span>{{ row.status.replace('_', ' ') }}</span>
             </div>
-            <small>{{ row.timestamp_suspect_reason or 'No additional reason' }}</small>
+            <small>{{ row.timestamp_suspect_reason or row.match_ambiguity or 'No additional reason' }}</small>
           </article>
           {% endfor %}
         </div>

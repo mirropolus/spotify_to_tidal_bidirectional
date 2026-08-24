@@ -426,6 +426,7 @@ def create_app(
             state.audit_preview = [
                 row for row in rows
                 if row["status"] in {"timestamp_mismatch", "match_failed"}
+                or row.get("match_ambiguity")
             ][:20]
             state.audit_warnings = audit_integrity_warnings(rows)
             state.audit_generated_at = datetime.datetime.now(

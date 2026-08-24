@@ -168,6 +168,12 @@ suspicion reason. `spotify_id` is populated only when the item is actually in
 Liked Songs; `spotify_catalog_candidate_id` is only a search result for a
 Tidal-only favorite.
 
+Presence is evaluated many-to-many with the same semantic matcher used by sync.
+Alternative provider IDs for the same recording are listed in
+`matched_tidal_ids` and `matched_spotify_ids`; they are not incorrectly counted
+as service-only entries. Match counts, `timestamp_reference_tidal_id`, and
+`match_ambiguity` make version and historical-date ambiguity explicit.
+
 Repeated collection resources with the same provider track ID are collapsed
 before matching, so the report contains no duplicate saved-library IDs. The
 earliest historical timestamp is retained. The source occurrence and conflict
@@ -177,6 +183,7 @@ integrity warning when it occurs. Statuses are:
 | Status | Meaning |
 |---|---|
 | `matched` | Present in both saved libraries; no suspicious later Spotify timestamp detected |
+| `matched_equivalent` | An additional provider ID maps to a recording already present on the other service |
 | `timestamp_mismatch` | Present in both, but Spotify was added much later than Tidal |
 | `tidal_only` | Saved only in Tidal and a Spotify catalog equivalent was found |
 | `spotify_only` | Saved only in Spotify |
@@ -195,6 +202,7 @@ audit_timestamp_cluster_min_delta_hours: 24
 ```
 
 The report is diagnostic only. It does not remove/re-add likes or repair dates.
+Rows with `match_ambiguity` must not be used as automatic repair instructions.
 
 ---
 

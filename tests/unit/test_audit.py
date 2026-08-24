@@ -207,6 +207,123 @@ def test_audit_deduplicates_spotify_saved_ids_and_keeps_earliest_added_at():
     assert rows[0]["spotify_source_duplicate_conflict"] == "added_at_conflict"
 
 
+def test_spotify_alternative_version_is_matched_equivalent_not_spotify_only():
+    tidal = [
+        tidal_track(
+            "tidal-one",
+            "ISRCONE",
+            datetime.datetime(2026, 5, 26, 8, 0, tzinfo=UTC),
+        )
+    ]
+    spotify = [
+        saved_item("spotify-one", "ISRCONE", "2026-05-26T08:20:00Z"),
+        saved_item("spotify-alternative", "ISRCONE", "2026-05-26T08:21:00Z"),
+    ]
+
+    rows = build_favorites_audit_rows(tidal, spotify)
+    by_spotify = {row["spotify_id"]: row for row in rows if row["spotify_id"]}
+
+    assert by_spotify["spotify-one"]["status"] == "matched"
+    alternative = by_spotify["spotify-alternative"]
+    assert alternative["status"] == "matched_equivalent"
+    assert alternative["matched_tidal_ids"] == "tidal-one"
+    assert alternative["matched_spotify_ids"] == "spotify-alternative;spotify-one"
+    assert alternative["spotify_match_count"] == 2
+    assert "multiple_spotify_equivalents" in alternative["match_ambiguity"]
+    assert not any(row["status"] == "spotify_only" for row in rows)
+
+
+def test_tidal_alternative_version_is_matched_equivalent_not_tidal_only():
+    tidal = [
+        tidal_track(
+            "tidal-one",
+            "ISRCONE",
+            datetime.datetime(2026, 5, 26, 8, 0, tzinfo=UTC),
+        ),
+        tidal_track(
+            "tidal-alternative",
+            "ISRCONE",
+            datetime.datetime(2026, 5, 26, 8, 5, tzinfo=UTC),
+        ),
+    ]
+    spotify = [
+        saved_item("spotify-one", "ISRCONE", "2026-05-26T08:20:00Z"),
+    ]
+
+    rows = build_favorites_audit_rows(
+        tidal,
+        spotify,
+        {"tidal-alternative": spotify_track("catalog-wrongly-used", "ISRCONE")},
+    )
+    by_tidal = {row["tidal_id"]: row for row in rows if row["tidal_id"]}
+
+    alternative = by_tidal["tidal-alternative"]
+    assert alternative["status"] == "matched_equivalent"
+    assert alternative["spotify_catalog_candidate_id"] == ""
+    assert alternative["matched_spotify_ids"] == "spotify-one"
+    assert not any(row["status"] == "tidal_only" for row in rows)
+
+
+def test_alternative_spotify_version_gets_timestamp_alert_from_tidal_reference():
+    tidal = [
+        tidal_track(
+            "tidal-one",
+            "ISRCONE",
+            datetime.datetime(2026, 4, 28, 8, 0, tzinfo=UTC),
+        )
+    ]
+    spotify = [
+        saved_item("spotify-one", "ISRCONE", "2026-05-26T08:28:10Z"),
+        saved_item("spotify-alternative", "ISRCONE", "2026-05-26T08:28:11Z"),
+        saved_item("spotify-other", "ISRCOTHER", "2026-05-26T08:28:12Z"),
+    ]
+
+    rows = build_favorites_audit_rows(tidal, spotify)
+    alternative = next(
+        row for row in rows if row["spotify_id"] == "spotify-alternative"
+    )
+
+    assert alternative["status"] == "timestamp_mismatch"
+    assert alternative["timestamp_reference_tidal_id"] == "tidal-one"
+    assert alternative["spotify_added_cluster_size"] == 3
+    assert alternative["timestamp_suspect_reason"] == (
+        "spotify_added_later_than_tidal_in_cluster;clustered_spotify_added_at"
+    )
+
+
+def test_catalog_search_runs_only_for_semantically_unmatched_tidal_tracks(mocker):
+    tidal = [
+        tidal_track(
+            "tidal-one",
+            "ISRCONE",
+            datetime.datetime(2026, 5, 26, tzinfo=UTC),
+        ),
+        tidal_track(
+            "tidal-alternative",
+            "ISRCONE",
+            datetime.datetime(2026, 5, 27, tzinfo=UTC),
+        ),
+    ]
+    spotify_session = MagicMock()
+    spotify_session.current_user_saved_tracks.return_value = {
+        "items": [saved_item("spotify-one", "ISRCONE", "2026-05-26T01:00:00Z")],
+        "next": None,
+        "limit": 50,
+        "total": 1,
+    }
+    catalog = mocker.patch(
+        "spotify_to_tidal.audit._catalog_matches_for_unmatched",
+        new=mocker.AsyncMock(return_value={}),
+    )
+
+    rows = asyncio.run(
+        collect_favorites_audit_rows_from_tracks(spotify_session, tidal, {})
+    )
+
+    catalog.assert_awaited_once_with(spotify_session, [], {})
+    assert {row["status"] for row in rows} == {"matched", "matched_equivalent"}
+
+
 def test_audit_is_account_read_only_and_writes_csv(mocker, tmp_path):
     tidal_favorite = tidal_track(
         "tidal-matched",

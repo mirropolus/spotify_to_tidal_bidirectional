@@ -163,6 +163,7 @@ timestamp delta, minute-level cluster information, source occurrence/conflict
 fields, and one of these statuses:
 
 - `matched`
+- `matched_equivalent`
 - `timestamp_mismatch`
 - `tidal_only`
 - `spotify_only`
@@ -181,6 +182,13 @@ when duplicates or conflicts were found.
 `spotify_id` means the track is actually present in Liked Songs. A catalog
 search hit for a Tidal-only favorite appears only in
 `spotify_catalog_candidate_id`; it must not be counted as an existing like.
+
+Matching is many-to-many because one recording can have several provider track
+IDs. `matched_tidal_ids`, `matched_spotify_ids`, their count columns,
+`timestamp_reference_tidal_id`, and `match_ambiguity` expose those relationships
+without misclassifying alternative IDs as service-only. Every actual provider
+ID still appears in at most one primary ID column. Ambiguous rows are diagnostic
+and are excluded from any future automatic repair plan.
 
 The default timestamp heuristic flags Spotify dates more than 30 days after
 Tidal. It also examines all Spotify likes at UTC-minute precision: a paired

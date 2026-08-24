@@ -27,6 +27,12 @@ AUDIT_FIELDS = [
     "tidal_id",
     "spotify_id",
     "spotify_catalog_candidate_id",
+    "matched_tidal_ids",
+    "matched_spotify_ids",
+    "tidal_match_count",
+    "spotify_match_count",
+    "match_ambiguity",
+    "timestamp_reference_tidal_id",
     "isrc",
     "artist",
     "title",
@@ -248,6 +254,74 @@ def _pair_saved_favorites(
     return pairs, tidal_unmatched, spotify_unmatched
 
 
+def _favorite_equivalence_maps(
+    tidal_tracks: Sequence,
+    spotify_saved_items: Sequence[dict],
+) -> tuple[dict[str, list[dict]], dict[str, list[object]]]:
+    """Return every cross-service semantic match without consuming either side."""
+    tidal_to_spotify: dict[str, list[dict]] = defaultdict(list)
+    spotify_to_tidal: dict[str, list[object]] = defaultdict(list)
+    for tidal_track in tidal_tracks:
+        tidal_id = str(getattr(tidal_track, "id", ""))
+        for spotify_item in spotify_saved_items:
+            spotify_track = spotify_item["track"]
+            spotify_id = str(spotify_track.get("id", ""))
+            if match(tidal_track, spotify_track):
+                tidal_to_spotify[tidal_id].append(spotify_item)
+                spotify_to_tidal[spotify_id].append(tidal_track)
+    return dict(tidal_to_spotify), dict(spotify_to_tidal)
+
+
+def _timestamp_reference(tidal_tracks: Sequence) -> object | None:
+    if not tidal_tracks:
+        return None
+    return min(
+        tidal_tracks,
+        key=lambda track: (
+            _tidal_date_added(track) is None,
+            _tidal_date_added(track)
+            or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+            str(getattr(track, "id", "")),
+        ),
+    )
+
+
+def _equivalence_fields(
+    tidal_matches: Sequence,
+    spotify_matches: Sequence[dict],
+    *,
+    timestamp_reference=None,
+) -> dict:
+    tidal_ids = sorted({str(track.id) for track in tidal_matches})
+    spotify_ids = sorted({
+        str(item["track"].get("id", ""))
+        for item in spotify_matches
+        if item["track"].get("id")
+    })
+    ambiguities = []
+    if len(tidal_ids) > 1:
+        ambiguities.append("multiple_tidal_equivalents")
+        dates = {
+            spotify_added_at(date)
+            for track in tidal_matches
+            if (date := _tidal_date_added(track)) is not None
+        }
+        if len(dates) > 1:
+            ambiguities.append("multiple_tidal_dates")
+    if len(spotify_ids) > 1:
+        ambiguities.append("multiple_spotify_equivalents")
+    return {
+        "matched_tidal_ids": ";".join(tidal_ids),
+        "matched_spotify_ids": ";".join(spotify_ids),
+        "tidal_match_count": len(tidal_ids),
+        "spotify_match_count": len(spotify_ids),
+        "match_ambiguity": ";".join(ambiguities),
+        "timestamp_reference_tidal_id": (
+            str(timestamp_reference.id) if timestamp_reference is not None else ""
+        ),
+    }
+
+
 def build_favorites_audit_rows(
     tidal_tracks: Sequence,
     spotify_saved_items: Sequence[dict],
@@ -264,6 +338,10 @@ def build_favorites_audit_rows(
         spotify_saved_items
     )
     pairs, tidal_unmatched, spotify_unmatched = _pair_saved_favorites(
+        tidal_tracks,
+        spotify_saved_items,
+    )
+    tidal_to_spotify, spotify_to_tidal = _favorite_equivalence_maps(
         tidal_tracks,
         spotify_saved_items,
     )
@@ -287,17 +365,27 @@ def build_favorites_audit_rows(
             "spotify_source_duplicate_conflict": spotify_info["conflict"],
         }
 
-    for tidal_track, spotify_item in pairs:
-        spotify_track = spotify_item["track"]
-        isrc, artist, title = _tidal_metadata(tidal_track)
-        tidal_date = _tidal_date_added(tidal_track)
+    def related_spotify_items(tidal_matches: Sequence) -> list[dict]:
+        by_id = {}
+        for track in tidal_matches:
+            for item in tidal_to_spotify.get(str(track.id), []):
+                spotify_id = str(item["track"].get("id", ""))
+                if spotify_id:
+                    by_id[spotify_id] = item
+        return list(by_id.values())
+
+    def timestamp_fields(
+        spotify_item: dict,
+        reference_tidal,
+        default_status: str,
+    ) -> dict:
+        tidal_date = _tidal_date_added(reference_tidal) if reference_tidal else None
         spotify_date = _parse_spotify_datetime(spotify_item.get("added_at"))
         delta = None
-        status = "matched"
+        status = default_status
         reason = ""
         if tidal_date is not None and spotify_date is not None:
-            tidal_date_utc = _parse_spotify_datetime(tidal_date)
-            delta = int((spotify_date - tidal_date_utc).total_seconds())
+            delta = int((spotify_date - tidal_date).total_seconds())
             if delta > mismatch_seconds:
                 status = "timestamp_mismatch"
                 reason = "spotify_added_much_later_than_tidal"
@@ -305,29 +393,52 @@ def build_favorites_audit_rows(
             reason = "missing_tidal_date_added"
         elif spotify_date is None:
             reason = "missing_spotify_added_at"
-
-        rows.append({
-            "tidal_id": str(tidal_track.id),
-            "spotify_id": spotify_track.get("id", ""),
-            "spotify_catalog_candidate_id": "",
-            "isrc": isrc or _spotify_metadata(spotify_track)[0],
-            "artist": artist,
-            "title": title,
+        return {
             "tidal_date_added": spotify_added_at(tidal_date) if tidal_date else "",
             "spotify_added_at": spotify_added_at(spotify_date) if spotify_date else "",
             "status": status,
             "timestamp_delta_seconds": delta if delta is not None else "",
             "spotify_added_cluster_size": "",
             "timestamp_suspect_reason": reason,
+        }
+
+    for tidal_track, spotify_item in pairs:
+        spotify_track = spotify_item["track"]
+        spotify_id = str(spotify_track.get("id", ""))
+        tidal_matches = spotify_to_tidal.get(spotify_id, [tidal_track])
+        spotify_matches = related_spotify_items(tidal_matches)
+        reference_tidal = _timestamp_reference(tidal_matches)
+        isrc, artist, title = _tidal_metadata(tidal_track)
+
+        rows.append({
+            "tidal_id": str(tidal_track.id),
+            "spotify_id": spotify_id,
+            "spotify_catalog_candidate_id": "",
+            "isrc": isrc or _spotify_metadata(spotify_track)[0],
+            "artist": artist,
+            "title": title,
+            **_equivalence_fields(
+                tidal_matches,
+                spotify_matches,
+                timestamp_reference=reference_tidal,
+            ),
+            **timestamp_fields(spotify_item, reference_tidal, "matched"),
             **source_fields(tidal_track, spotify_track),
         })
 
     for tidal_track in tidal_unmatched:
-        catalog_track = catalog_matches.get(str(tidal_track.id))
+        tidal_id = str(tidal_track.id)
+        spotify_matches = tidal_to_spotify.get(tidal_id, [])
+        catalog_track = None if spotify_matches else catalog_matches.get(tidal_id)
         isrc, artist, title = _tidal_metadata(tidal_track)
         tidal_date = _tidal_date_added(tidal_track)
+        status = (
+            "matched_equivalent"
+            if spotify_matches
+            else "tidal_only" if catalog_track else "match_failed"
+        )
         rows.append({
-            "tidal_id": str(tidal_track.id),
+            "tidal_id": tidal_id,
             "spotify_id": "",
             "spotify_catalog_candidate_id": (
                 catalog_track.get("id", "") if catalog_track else ""
@@ -335,9 +446,10 @@ def build_favorites_audit_rows(
             "isrc": isrc,
             "artist": artist,
             "title": title,
+            **_equivalence_fields([tidal_track], spotify_matches),
             "tidal_date_added": spotify_added_at(tidal_date) if tidal_date else "",
             "spotify_added_at": "",
-            "status": "tidal_only" if catalog_track else "match_failed",
+            "status": status,
             "timestamp_delta_seconds": "",
             "spotify_added_cluster_size": "",
             "timestamp_suspect_reason": "missing_tidal_date_added" if tidal_date is None else "",
@@ -346,23 +458,42 @@ def build_favorites_audit_rows(
 
     for spotify_item in spotify_unmatched:
         spotify_track = spotify_item["track"]
+        spotify_id = str(spotify_track.get("id", ""))
+        tidal_matches = spotify_to_tidal.get(spotify_id, [])
+        spotify_matches = related_spotify_items(tidal_matches)
+        reference_tidal = _timestamp_reference(tidal_matches)
         isrc, artist, title = _spotify_metadata(spotify_track)
-        spotify_date = _parse_spotify_datetime(spotify_item.get("added_at"))
-        rows.append({
+        row = {
             "tidal_id": "",
-            "spotify_id": spotify_track.get("id", ""),
+            "spotify_id": spotify_id,
             "spotify_catalog_candidate_id": "",
             "isrc": isrc,
             "artist": artist,
             "title": title,
-            "tidal_date_added": "",
-            "spotify_added_at": spotify_added_at(spotify_date) if spotify_date else "",
-            "status": "spotify_only",
-            "timestamp_delta_seconds": "",
-            "spotify_added_cluster_size": "",
-            "timestamp_suspect_reason": "",
+            **_equivalence_fields(
+                tidal_matches,
+                spotify_matches,
+                timestamp_reference=reference_tidal,
+            ),
             **source_fields(spotify_track=spotify_track),
-        })
+        }
+        if reference_tidal is not None:
+            row.update(timestamp_fields(
+                spotify_item,
+                reference_tidal,
+                "matched_equivalent",
+            ))
+        else:
+            spotify_date = _parse_spotify_datetime(spotify_item.get("added_at"))
+            row.update({
+                "tidal_date_added": "",
+                "spotify_added_at": spotify_added_at(spotify_date) if spotify_date else "",
+                "status": "spotify_only",
+                "timestamp_delta_seconds": "",
+                "spotify_added_cluster_size": "",
+                "timestamp_suspect_reason": "",
+            })
+        rows.append(row)
 
     spotify_additions_by_minute = Counter(
         row["spotify_added_at"][:16]
@@ -376,13 +507,13 @@ def build_favorites_audit_rows(
         row["spotify_added_cluster_size"] = count
         delta = row["timestamp_delta_seconds"]
         clustered_mismatch = (
-            row["tidal_id"]
+            row["timestamp_reference_tidal_id"]
             and isinstance(delta, int)
             and delta > cluster_min_delta_seconds
             and count >= cluster_size
         )
         if clustered_mismatch:
-            if row["status"] == "matched":
+            if row["status"] in {"matched", "matched_equivalent"}:
                 row["status"] = "timestamp_mismatch"
                 row["timestamp_suspect_reason"] = "spotify_added_later_than_tidal_in_cluster"
             if "clustered_spotify_added_at" not in row["timestamp_suspect_reason"]:
@@ -414,6 +545,12 @@ def audit_integrity_warnings(rows: Sequence[dict]) -> list[str]:
                 f"{conflicts} duplicated {label} IDs had conflicting source data; "
                 "inspect the CSV conflict column before planning changes."
             )
+    ambiguous = [row for row in rows if row.get("match_ambiguity")]
+    if ambiguous:
+        warnings.append(
+            f"{len(ambiguous)} provider entries have multiple cross-service "
+            "equivalents; inspect match_ambiguity before planning changes."
+        )
     return warnings
 
 
@@ -562,7 +699,16 @@ async def collect_favorites_audit_rows_from_tracks(
         ) from exc
 
     try:
-        _, tidal_unmatched, _ = _pair_saved_favorites(tidal_tracks, spotify_items)
+        unique_tidal, _ = _deduplicate_tidal_tracks(tidal_tracks)
+        unique_spotify, _ = _deduplicate_spotify_saved_items(spotify_items)
+        tidal_to_spotify, _ = _favorite_equivalence_maps(
+            unique_tidal,
+            unique_spotify,
+        )
+        tidal_unmatched = [
+            track for track in unique_tidal
+            if not tidal_to_spotify.get(str(track.id))
+        ]
     except Exception as exc:
         raise AuditStageError(
             f"Favorites pairing failed ({type(exc).__name__})"
