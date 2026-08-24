@@ -113,6 +113,77 @@ Replace `1ABCDEqsABCD6EaABCDa0a` with your playlist ID (found in the Spotify pla
 python3.11 -m spotify_to_tidal --sync-favorites
 ```
 
+To import Tidal favorites into Spotify Liked Songs, add the direction:
+
+```bash
+python3.11 -m spotify_to_tidal --sync-favorites --sync-direction tidal_to_spotify
+```
+
+### Liked Songs chronology
+
+New Tidal-only favorites are saved to Spotify with the original Tidal
+`date_added` value. The sync sends Spotify's documented `timestamped_ids`
+payload in batches of 50, with timestamps converted to UTC ISO 8601. Request
+order therefore does not determine Liked Songs chronology.
+
+The favorites sync is deliberately non-destructive:
+
+- existing Spotify likes are not submitted again and retain their current
+  `added_at` value;
+- no likes or favorites are removed;
+- the library is not rebuilt;
+- a Tidal favorite without `date_added` is logged and skipped rather than being
+  assigned the current time.
+
+The timestamped format is currently available on Spotify's
+[Save Tracks for Current User endpoint](https://developer.spotify.com/documentation/web-api/reference/save-tracks-user).
+Spotify marks that endpoint deprecated in favor of the generic library endpoint,
+but the generic endpoint does not currently expose historical timestamps.
+
+> Versions of this fork before this fix may have imported old Tidal favorites
+> with a new Spotify `added_at`. Normal syncs do not repair those historical
+> entries because doing so would require destructive remove/re-add operations.
+
+### Audit favorites safely
+
+Generate a read-only CSV comparison without changing either account:
+
+```bash
+python3.11 -m spotify_to_tidal --audit-favorites
+```
+
+The default report is `favorites_audit.csv` in the current directory. Choose a
+different location with:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --audit-favorites \
+  --audit-output reports/favorites_audit.csv
+```
+
+The CSV contains Tidal and Spotify IDs, ISRC, artist, title, both service
+timestamps, signed timestamp delta, status, same-day cluster size, and a
+suspicion reason. Statuses are:
+
+| Status | Meaning |
+|---|---|
+| `matched` | Present in both saved libraries; no suspicious later Spotify timestamp detected |
+| `timestamp_mismatch` | Present in both, but Spotify was added much later than Tidal |
+| `tidal_only` | Saved only in Tidal and a Spotify catalog equivalent was found |
+| `spotify_only` | Saved only in Spotify |
+| `match_failed` | Saved in Tidal but no safe Spotify catalog match was found |
+
+By default, a timestamp is suspicious when Spotify is more than 30 days later
+than Tidal. Three or more suspicious additions on the same Spotify calendar day
+are also marked as a cluster. These heuristics can be adjusted in `config.yml`:
+
+```yaml
+audit_timestamp_mismatch_days: 30
+audit_timestamp_cluster_size: 3
+```
+
+The report is diagnostic only. It does not remove/re-add likes or repair dates.
+
 ---
 
 ## Bidirectional sync
@@ -180,19 +251,42 @@ sync_playlists:
 
 ---
 
-## Running daily (recommended)
+## Manual favorites sync with GitHub Actions
 
-To keep both services in sync automatically, schedule the tool to run once a day. On macOS/Linux you can use `cron`:
+`.github/workflows/sync.yml` currently provides only a manual
+`workflow_dispatch` trigger. Its command includes `--sync-favorites
+--sync-direction bidirectional`, so it synchronizes only Tidal favorites and
+Spotify Liked Songs. It does not synchronize playlists and does not run an
+automatic historical repair.
 
-```bash
-crontab -e
-```
+Create these repository secrets under **Settings → Secrets and variables →
+Actions** before enabling the workflow:
 
-Add a line like this (runs every day at 8am):
+| Secret | Purpose |
+|---|---|
+| `SPOTIFY_CLIENT_ID` | Spotify application client ID |
+| `SPOTIFY_CLIENT_SECRET` | Spotify application client secret |
+| `SPOTIFY_REFRESH_TOKEN` | Refresh token from a prior local Spotify authorization with the required scopes |
+| `TIDAL_ACCESS_TOKEN` | Access token from a prior local Tidal OAuth session |
+| `TIDAL_REFRESH_TOKEN` | Refresh token from that Tidal OAuth session |
 
-```
-0 8 * * * cd /path/to/spotify_to_tidal_bidirectional && PYTHONPATH=/usr/local/lib/python3.11/site-packages:src python3.11 -m spotify_to_tidal
-```
+Authentication remains backward-compatible locally: Spotipy uses its existing
+cache and Tidal uses `.session.yml`. In CI, the environment variables above are
+used explicitly, browser login is disabled, and refreshed Spotify tokens are
+held in memory rather than written to `.cache-*`. Tidal environment credentials
+are likewise not written to `.session.yml`.
+
+Do not commit token caches or use them as workflow artifacts. `config.yml`,
+`config.yaml`, `.cache*`, `.session.yml`, `.env`, and generated favorites audit
+CSVs are ignored by Git. The workflow grants only read access to repository
+contents and does not upload session files or caches.
+
+After merging, add the secrets and use **Run workflow** for the first real
+production execution. Review its logs and the favorites audit before enabling
+any recurring execution. The daily `schedule` trigger is intentionally omitted
+for now and should be added in a later change only after that manual run has
+been validated. Playlist synchronization should remain out of this workflow
+until it is reviewed separately.
 
 ---
 
