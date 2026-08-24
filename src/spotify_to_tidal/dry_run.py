@@ -167,6 +167,70 @@ def load_audit_crosscheck(path: str | Path | None) -> dict:
     return snapshot
 
 
+def load_approved_favorites_plan(path: str | Path) -> dict[str, str]:
+    """Load strict Spotify-to-Tidal source/target pairs from a reviewed plan."""
+    approved: dict[str, str] = {}
+    seen_targets: set[str] = set()
+    with Path(path).open(newline="", encoding="utf-8-sig") as report:
+        reader = csv.DictReader(report)
+        required = {
+            "direction",
+            "action",
+            "safety_flags",
+            "source_service",
+            "source_id",
+            "target_service",
+            "target_candidate_id",
+            "match_method",
+        }
+        missing = required.difference(reader.fieldnames or [])
+        if missing:
+            raise ValueError(
+                "approved plan is missing required columns: "
+                + ", ".join(sorted(missing))
+            )
+
+        for line_number, row in enumerate(reader, start=2):
+            if (
+                row.get("direction") != "spotify_to_tidal"
+                or row.get("action") != "would_add"
+            ):
+                continue
+            source_id = (row.get("source_id") or "").strip()
+            target_id = (row.get("target_candidate_id") or "").strip()
+            if row.get("source_service") != "spotify":
+                raise ValueError(
+                    f"line {line_number}: approved source service must be spotify"
+                )
+            if row.get("target_service") != "tidal":
+                raise ValueError(
+                    f"line {line_number}: approved target service must be tidal"
+                )
+            if not source_id or not target_id:
+                raise ValueError(
+                    f"line {line_number}: approved source and target IDs are required"
+                )
+            if (row.get("safety_flags") or "").strip():
+                raise ValueError(
+                    f"line {line_number}: would_add row contains safety flags"
+                )
+            if row.get("match_method") != "exact_isrc":
+                raise ValueError(
+                    f"line {line_number}: approved match must use exact_isrc"
+                )
+            if source_id in approved:
+                raise ValueError(
+                    f"line {line_number}: duplicate approved Spotify source ID"
+                )
+            if target_id in seen_targets:
+                raise ValueError(
+                    f"line {line_number}: duplicate approved Tidal target ID"
+                )
+            approved[source_id] = target_id
+            seen_targets.add(target_id)
+    return approved
+
+
 def _parse_datetime(value: str | None) -> datetime.datetime | None:
     if not value:
         return None

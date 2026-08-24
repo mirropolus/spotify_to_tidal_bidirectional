@@ -38,6 +38,10 @@ def main():
         help='optional prior favorites audit CSV used to block contradictory plan rows',
     )
     parser.add_argument(
+        '--approved-favorites-plan',
+        help='reviewed dry-run CSV required before Spotify-to-Tidal favorite writes',
+    )
+    parser.add_argument(
         '--sync-direction',
         dest='sync_direction',
         choices=['spotify_to_tidal', 'tidal_to_spotify', 'bidirectional'],
@@ -51,6 +55,28 @@ def main():
 
     if args.audit_favorites and args.dry_run:
         sys.exit("Choose either --audit-favorites or --dry-run, not both")
+    if args.approved_favorites_plan and (args.audit_favorites or args.dry_run):
+        sys.exit(
+            "--approved-favorites-plan is only valid for a real favorites sync"
+        )
+    if args.approved_favorites_plan and args.uri:
+        sys.exit("--approved-favorites-plan cannot be combined with --uri")
+    if args.approved_favorites_plan and args.sync_favorites is not True:
+        sys.exit("--approved-favorites-plan requires --sync-favorites")
+
+    approved_plan = None
+    if args.approved_favorites_plan:
+        if not Path(args.approved_favorites_plan).is_file():
+            sys.exit(
+                "--approved-favorites-plan does not exist or is not a file: "
+                f"{args.approved_favorites_plan}"
+            )
+        try:
+            approved_plan = _dry_run.load_approved_favorites_plan(
+                args.approved_favorites_plan
+            )
+        except (OSError, ValueError) as exc:
+            sys.exit(f"Invalid --approved-favorites-plan: {exc}")
 
     if args.audit_favorites:
         print("Opening read-only Spotify session")
@@ -108,6 +134,19 @@ def main():
 
     # Resolve sync direction: CLI > config > default ("spotify_to_tidal")
     sync_direction = _sync.resolve_sync_direction(config, args.sync_direction)
+    if args.approved_favorites_plan and sync_direction == "tidal_to_spotify":
+        sys.exit(
+            "--approved-favorites-plan is unnecessary for tidal_to_spotify"
+        )
+    if (
+        args.sync_favorites is True
+        and sync_direction in {"spotify_to_tidal", "bidirectional"}
+        and approved_plan is None
+    ):
+        sys.exit(
+            "Spotify-to-Tidal favorites writes require "
+            "--approved-favorites-plan from a reviewed dry-run CSV"
+        )
 
     print("Opening Spotify session")
     spotify_session = _auth.open_spotify_session(config['spotify'], sync_direction=sync_direction)
@@ -152,13 +191,31 @@ def main():
         sync_favorites = args.sync_favorites is None and config.get('sync_favorites_default', True)
 
     if sync_favorites:
+        if (
+            sync_direction in {"spotify_to_tidal", "bidirectional"}
+            and approved_plan is None
+        ):
+            sys.exit(
+                "Spotify-to-Tidal favorites writes require "
+                "--approved-favorites-plan from a reviewed dry-run CSV"
+            )
         if sync_direction == "tidal_to_spotify":
             _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
         elif sync_direction == "bidirectional":
-            _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
+            _sync.sync_favorites_wrapper(
+                spotify_session,
+                tidal_session,
+                config,
+                approved_plan,
+            )
             _sync.sync_favorites_tidal_to_spotify_wrapper(spotify_session, tidal_session, config)
         else:
-            _sync.sync_favorites_wrapper(spotify_session, tidal_session, config)
+            _sync.sync_favorites_wrapper(
+                spotify_session,
+                tidal_session,
+                config,
+                approved_plan,
+            )
 
 if __name__ == '__main__':
     main()

@@ -894,8 +894,13 @@ async def sync_playlist_bidirectional(
         )
 
 
-async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict):
-    """ sync user favorites to tidal """
+async def sync_favorites(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    config: dict,
+    approved_plan: Mapping[str, str] | None = None,
+):
+    """Sync Spotify favorites to Tidal, optionally gated by an approved plan."""
     async def get_tracks_from_spotify_favorites() -> List[dict]:
         _get_favorite_tracks = lambda offset: spotify_session.current_user_saved_tracks(offset=offset)    
         tracks = await repeat_on_request_error( _fetch_all_from_spotify_in_chunks, _get_favorite_tracks)
@@ -917,15 +922,82 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
                 seen_ids.add(match_id)
         return new_ids
 
+    async def get_approved_tidal_favorites() -> List[int]:
+        existing_favorite_ids = {str(track.id) for track in old_tidal_tracks}
+        spotify_by_id = {str(track['id']): track for track in spotify_tracks}
+        new_ids = []
+        for spotify_id, expected_tidal_id in approved_plan.items():
+            spotify_track = spotify_by_id.get(spotify_id)
+            if spotify_track is None:
+                logger.warning(
+                    "Skipping approved Spotify track %s: it is no longer in Liked Songs",
+                    spotify_id,
+                )
+                continue
+            if expected_tidal_id in existing_favorite_ids:
+                print(
+                    f"Approved Tidal target {expected_tidal_id} is already a favorite; "
+                    "no write is needed"
+                )
+                continue
+
+            request_id = (
+                int(expected_tidal_id)
+                if expected_tidal_id.isdigit()
+                else expected_tidal_id
+            )
+            candidate = await repeat_on_request_error(
+                asyncio.to_thread,
+                tidal_session.track,
+                request_id,
+            )
+            if (
+                candidate is None
+                or str(getattr(candidate, 'id', '')) != expected_tidal_id
+                or not getattr(candidate, 'available', True)
+            ):
+                logger.warning(
+                    "Skipping approved Spotify track %s: Tidal target %s is unavailable",
+                    spotify_id,
+                    expected_tidal_id,
+                )
+                continue
+            try:
+                candidate_is_exact = isrc_match(candidate, spotify_track)
+            except (AttributeError, KeyError, TypeError):
+                candidate_is_exact = False
+            if not candidate_is_exact:
+                logger.warning(
+                    "Skipping approved Spotify track %s: Tidal target %s no longer "
+                    "has the reviewed exact ISRC",
+                    spotify_id,
+                    expected_tidal_id,
+                )
+                continue
+            new_ids.append(candidate.id)
+        return new_ids
+
     print("Loading favorite tracks from Spotify")
     spotify_tracks = await get_tracks_from_spotify_favorites()
     spotify_tracks = list({track['id']: track for track in spotify_tracks}.values())
     print("Loading existing favorite tracks from Tidal")
     old_tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
     old_tidal_tracks = deduplicate_tidal_favorites(old_tidal_tracks)
-    populate_track_match_cache(spotify_tracks, old_tidal_tracks)
-    await search_new_tracks_on_tidal(tidal_session, spotify_tracks, "Favorites", config)
-    new_tidal_favorite_ids = get_new_tidal_favorites()
+    if approved_plan is None:
+        populate_track_match_cache(spotify_tracks, old_tidal_tracks)
+        await search_new_tracks_on_tidal(
+            tidal_session,
+            spotify_tracks,
+            "Favorites",
+            config,
+        )
+        new_tidal_favorite_ids = get_new_tidal_favorites()
+    else:
+        print(
+            f"Applying approved Spotify-to-Tidal favorites plan "
+            f"({len(approved_plan)} exact source/target pairs)"
+        )
+        new_tidal_favorite_ids = await get_approved_tidal_favorites()
     if new_tidal_favorite_ids:
         for tidal_id in tqdm(new_tidal_favorite_ids, desc="Adding new tracks to Tidal favorites"):
             tidal_session.user.favorites.add_track(tidal_id)
@@ -1008,8 +1080,18 @@ def sync_playlists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tida
     # sync the spotify playlist to tidal
     asyncio.run(sync_playlist(spotify_session, tidal_session, spotify_playlist, tidal_playlist, config) )
 
-def sync_favorites_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config):
-    asyncio.run(main=sync_favorites(spotify_session=spotify_session, tidal_session=tidal_session, config=config))
+def sync_favorites_wrapper(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    config,
+    approved_plan: Mapping[str, str] | None = None,
+):
+    asyncio.run(main=sync_favorites(
+        spotify_session=spotify_session,
+        tidal_session=tidal_session,
+        config=config,
+        approved_plan=approved_plan,
+    ))
 
 def sync_playlists_tidal_to_spotify_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
     """Wrapper for Tidal→Spotify playlist sync. playlists is a list of (tidal_playlist, spotify_playlist) tuples."""

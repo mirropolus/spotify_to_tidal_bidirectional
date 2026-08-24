@@ -8,8 +8,10 @@ import pytest
 
 from spotify_to_tidal import __main__
 from spotify_to_tidal.dry_run import (
+    DRY_RUN_FIELDS,
     collect_favorites_dry_run_rows,
     favorites_dry_run,
+    load_approved_favorites_plan,
     load_audit_crosscheck,
 )
 from spotify_to_tidal.sync import tidal_search
@@ -442,6 +444,248 @@ def test_audit_crosscheck_does_not_treat_catalog_candidate_as_saved_id(tmp_path)
 
     assert snapshot["existing_tidal_ids"] == {"tidal-only"}
     assert snapshot["existing_spotify_ids"] == set()
+
+
+def _write_approved_plan(path, rows):
+    with path.open("w", newline="", encoding="utf-8") as report:
+        writer = csv.DictWriter(report, fieldnames=DRY_RUN_FIELDS)
+        writer.writeheader()
+        for values in rows:
+            row = {field: "" for field in DRY_RUN_FIELDS}
+            row.update(values)
+            writer.writerow(row)
+
+
+def test_approved_plan_loads_only_unflagged_exact_spotify_to_tidal_rows(tmp_path):
+    plan = tmp_path / "plan.csv"
+    _write_approved_plan(plan, [
+        {
+            "direction": "spotify_to_tidal",
+            "action": "would_add",
+            "source_service": "spotify",
+            "source_id": "spotify-approved",
+            "target_service": "tidal",
+            "target_candidate_id": "123",
+            "match_method": "exact_isrc",
+        },
+        {
+            "direction": "spotify_to_tidal",
+            "action": "origin_suspect",
+            "source_service": "spotify",
+            "source_id": "spotify-blocked",
+            "target_service": "tidal",
+            "target_candidate_id": "456",
+            "match_method": "exact_isrc",
+            "safety_flags": "clustered_spotify_added_at",
+        },
+        {
+            "direction": "tidal_to_spotify",
+            "action": "would_add",
+            "source_service": "tidal",
+            "source_id": "tidal-approved-separately",
+            "target_service": "spotify",
+            "target_candidate_id": "spotify-target",
+            "match_method": "exact_isrc",
+        },
+    ])
+
+    approved = load_approved_favorites_plan(plan)
+
+    assert approved == {"spotify-approved": "123"}
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"safety_flags": "unexpected_flag"}, "contains safety flags"),
+        ({"match_method": "metadata"}, "must use exact_isrc"),
+        ({"target_candidate_id": ""}, "source and target IDs are required"),
+    ],
+)
+def test_approved_plan_rejects_unsafe_would_add_rows(
+    tmp_path,
+    override,
+    message,
+):
+    plan = tmp_path / "plan.csv"
+    row = {
+        "direction": "spotify_to_tidal",
+        "action": "would_add",
+        "source_service": "spotify",
+        "source_id": "spotify-one",
+        "target_service": "tidal",
+        "target_candidate_id": "123",
+        "match_method": "exact_isrc",
+    }
+    row.update(override)
+    _write_approved_plan(plan, [row])
+
+    with pytest.raises(ValueError, match=message):
+        load_approved_favorites_plan(plan)
+
+
+def test_approved_plan_rejects_duplicate_destination_targets(tmp_path):
+    plan = tmp_path / "plan.csv"
+    common = {
+        "direction": "spotify_to_tidal",
+        "action": "would_add",
+        "source_service": "spotify",
+        "target_service": "tidal",
+        "target_candidate_id": "123",
+        "match_method": "exact_isrc",
+    }
+    _write_approved_plan(plan, [
+        {**common, "source_id": "spotify-one"},
+        {**common, "source_id": "spotify-two"},
+    ])
+
+    with pytest.raises(ValueError, match="duplicate approved Tidal target ID"):
+        load_approved_favorites_plan(plan)
+
+
+def test_approved_plan_rejects_duplicate_source_ids(tmp_path):
+    plan = tmp_path / "plan.csv"
+    common = {
+        "direction": "spotify_to_tidal",
+        "action": "would_add",
+        "source_service": "spotify",
+        "source_id": "spotify-one",
+        "target_service": "tidal",
+        "match_method": "exact_isrc",
+    }
+    _write_approved_plan(plan, [
+        {**common, "target_candidate_id": "123"},
+        {**common, "target_candidate_id": "456"},
+    ])
+
+    with pytest.raises(ValueError, match="duplicate approved Spotify source ID"):
+        load_approved_favorites_plan(plan)
+
+
+def test_approved_plan_rejects_incomplete_schema(tmp_path):
+    plan = tmp_path / "plan.csv"
+    plan.write_text(
+        "direction,action,source_id,target_candidate_id\n"
+        "spotify_to_tidal,would_add,spotify-one,123\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        load_approved_favorites_plan(plan)
+
+
+def test_real_spotify_to_tidal_favorites_requires_plan_before_authentication(
+    mocker,
+    tmp_path,
+):
+    config = tmp_path / "config.yml"
+    config.write_text("spotify:\n  client_id: test\n", encoding="utf-8")
+    open_spotify = mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_spotify_session"
+    )
+    open_tidal = mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_tidal_session"
+    )
+    mocker.patch("sys.argv", [
+        "spotify_to_tidal",
+        "--config", str(config),
+        "--sync-favorites",
+        "--sync-direction", "spotify_to_tidal",
+    ])
+
+    with pytest.raises(SystemExit, match="require --approved-favorites-plan"):
+        __main__.main()
+
+    open_spotify.assert_not_called()
+    open_tidal.assert_not_called()
+
+
+def test_real_spotify_to_tidal_favorites_passes_strict_approved_mapping(
+    mocker,
+    tmp_path,
+):
+    config = tmp_path / "config.yml"
+    config.write_text("spotify:\n  client_id: test\n", encoding="utf-8")
+    plan = tmp_path / "plan.csv"
+    _write_approved_plan(plan, [{
+        "direction": "spotify_to_tidal",
+        "action": "would_add",
+        "source_service": "spotify",
+        "source_id": "spotify-approved",
+        "target_service": "tidal",
+        "target_candidate_id": "123",
+        "match_method": "exact_isrc",
+    }])
+    spotify = MagicMock()
+    tidal = MagicMock()
+    tidal.check_login.return_value = True
+    mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_spotify_session",
+        return_value=spotify,
+    )
+    mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_tidal_session",
+        return_value=tidal,
+    )
+    sync = mocker.patch(
+        "spotify_to_tidal.__main__._sync.sync_favorites_wrapper"
+    )
+    reverse = mocker.patch(
+        "spotify_to_tidal.__main__._sync.sync_favorites_tidal_to_spotify_wrapper"
+    )
+    mocker.patch("sys.argv", [
+        "spotify_to_tidal",
+        "--config", str(config),
+        "--sync-favorites",
+        "--sync-direction", "spotify_to_tidal",
+        "--approved-favorites-plan", str(plan),
+    ])
+
+    __main__.main()
+
+    sync.assert_called_once_with(
+        spotify,
+        tidal,
+        mocker.ANY,
+        {"spotify-approved": "123"},
+    )
+    reverse.assert_not_called()
+
+
+def test_real_tidal_to_spotify_favorites_stays_available_without_plan(
+    mocker,
+    tmp_path,
+):
+    config = tmp_path / "config.yml"
+    config.write_text("spotify:\n  client_id: test\n", encoding="utf-8")
+    spotify = MagicMock()
+    tidal = MagicMock()
+    tidal.check_login.return_value = True
+    mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_spotify_session",
+        return_value=spotify,
+    )
+    mocker.patch(
+        "spotify_to_tidal.__main__._auth.open_tidal_session",
+        return_value=tidal,
+    )
+    forward = mocker.patch(
+        "spotify_to_tidal.__main__._sync.sync_favorites_wrapper"
+    )
+    reverse = mocker.patch(
+        "spotify_to_tidal.__main__._sync.sync_favorites_tidal_to_spotify_wrapper"
+    )
+    mocker.patch("sys.argv", [
+        "spotify_to_tidal",
+        "--config", str(config),
+        "--sync-favorites",
+        "--sync-direction", "tidal_to_spotify",
+    ])
+
+    __main__.main()
+
+    reverse.assert_called_once_with(spotify, tidal, mocker.ANY)
+    forward.assert_not_called()
 
 
 def test_dry_run_cli_passes_prior_audit_path(mocker, tmp_path):

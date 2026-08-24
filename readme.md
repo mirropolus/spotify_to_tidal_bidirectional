@@ -248,6 +248,27 @@ minimum same-UTC-minute Spotify cluster size and defaults to the audit cluster
 threshold (3). Cluster and audit checks are intentionally conservative: review
 their rows manually rather than treating them as confirmed errors.
 
+Spotify → Tidal favorites writes now require that reviewed CSV as an explicit
+approval plan:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --config config.yml \
+  --sync-favorites \
+  --sync-direction spotify_to_tidal \
+  --approved-favorites-plan favorites_dry_run.csv
+```
+
+The loader accepts only unflagged `spotify_to_tidal` rows whose action is
+`would_add` and whose match method is `exact_isrc`. It rejects missing or
+duplicate source/target IDs. Immediately before each write, the sync confirms
+that the Spotify source is still liked, the Tidal target is not already a
+favorite, and the reviewed Tidal ID is still available with the same exact
+ISRC. A stale or changed row is logged and skipped. The guarded path never
+falls back to an unreviewed catalog search. Rows such as `origin_suspect`,
+`audit_conflict`, `duplicate_target`, `metadata_review`, and `match_failed`
+cannot produce writes.
+
 Normal Tidal → Spotify favorites sync uses the same safety boundary: it
 deduplicates Tidal provider IDs, keeps the earliest historical date, and does
 not search or add a different Spotify version when any existing Liked Songs
@@ -324,10 +345,12 @@ sync_playlists:
 ## Manual favorites sync with GitHub Actions
 
 `.github/workflows/sync.yml` currently provides only a manual
-`workflow_dispatch` trigger. Its command includes `--sync-favorites
---sync-direction bidirectional`, so it synchronizes only Tidal favorites and
-Spotify Liked Songs. It does not synchronize playlists and does not run an
-automatic historical repair.
+`workflow_dispatch` trigger. For the first production validation, its command
+is deliberately limited to `--sync-favorites --sync-direction
+tidal_to_spotify`. It can add the reviewed missing Tidal favorites to Spotify
+Liked Songs with their historical timestamps, but it does not write Spotify
+likes back to Tidal, synchronize playlists, or run an automatic historical
+repair.
 
 Create these repository secrets under **Settings → Secrets and variables →
 Actions** before enabling the workflow:
@@ -352,12 +375,14 @@ CSVs are ignored by Git. The workflow grants only read access to repository
 contents and does not upload session files or caches.
 
 After merging, add the secrets and use **Run workflow** for the first real
-production execution—but only after a local bidirectional `--dry-run` CSV has
-been reviewed and approved. Review its logs and the favorites audit before
-enabling any recurring execution. The daily `schedule` trigger is intentionally
-omitted for now and should be added in a later change only after that manual run
-has been validated. Playlist synchronization should remain out of this workflow
-until it is reviewed separately.
+production execution. The current one-way command is the deliberately narrow
+first step: review its logs and run another favorites audit before enabling the
+Spotify → Tidal side. That second side must use an explicitly reviewed
+`--approved-favorites-plan`; do not change the workflow to bidirectional without
+providing and reviewing that plan. The daily `schedule` trigger is intentionally
+omitted for now and should be added in a later change only after the manual
+one-way run and its follow-up audit have been validated. Playlist synchronization
+should remain out of this workflow until it is reviewed separately.
 
 ---
 
