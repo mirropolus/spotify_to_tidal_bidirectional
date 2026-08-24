@@ -251,11 +251,12 @@ sync_playlists:
 
 ---
 
-## Running daily with GitHub Actions
+## Manual favorites sync with GitHub Actions
 
-`.github/workflows/sync.yml` provides a separate scheduled workflow (daily at
-04:17 UTC) and a manual `workflow_dispatch` trigger. It runs additive
-bidirectional sync using `conflict_resolution: both_win`; it does not run an
+`.github/workflows/sync.yml` currently provides only a manual
+`workflow_dispatch` trigger. Its command includes `--sync-favorites
+--sync-direction bidirectional`, so it synchronizes only Tidal favorites and
+Spotify Liked Songs. It does not synchronize playlists and does not run an
 automatic historical repair.
 
 Create these repository secrets under **Settings → Secrets and variables →
@@ -280,9 +281,12 @@ Do not commit token caches or use them as workflow artifacts. `config.yml`,
 CSVs are ignored by Git. The workflow grants only read access to repository
 contents and does not upload session files or caches.
 
-Scheduled workflows run from the repository's default branch, so review and
-merge the workflow before enabling it. Use **Run workflow** once after adding
-secrets to validate authentication before relying on the schedule.
+After merging, add the secrets and use **Run workflow** for the first real
+production execution. Review its logs and the favorites audit before enabling
+any recurring execution. The daily `schedule` trigger is intentionally omitted
+for now and should be added in a later change only after that manual run has
+been validated. Playlist synchronization should remain out of this workflow
+until it is reviewed separately.
 
 ---
 

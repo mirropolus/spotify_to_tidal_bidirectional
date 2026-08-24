@@ -1,15 +1,13 @@
-name: Daily Spotify-Tidal sync
+name: Manual Spotify-Tidal favorites sync
 
 on:
-  schedule:
-    - cron: '17 4 * * *'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: spotify-tidal-daily-sync
+  group: spotify-tidal-manual-favorites-sync
   cancel-in-progress: false
 
 jobs:
@@ -42,8 +40,9 @@ jobs:
       - name: Install
         run: python -m pip install -e .
 
-      - name: Run additive bidirectional sync
+      - name: Run bidirectional favorites sync
         run: >-
           python -m spotify_to_tidal
           --config example_config.yml
+          --sync-favorites
           --sync-direction bidirectional
