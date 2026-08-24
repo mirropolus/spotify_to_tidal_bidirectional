@@ -9,6 +9,7 @@ from spotify_to_tidal.webapp.tidal_auth import (
     TIDAL_AUDIT_SCOPES,
     TIDAL_OPENAPI_BASE_URL,
     TIDAL_TOKEN_URL,
+    TidalAPIError,
     TidalCredentials,
     TidalOAuthError,
     TidalOpenAPIClient,
@@ -16,6 +17,7 @@ from spotify_to_tidal.webapp.tidal_auth import (
     exchange_authorization_code,
     generate_pkce_verifier,
     pkce_s256,
+    _safe_next_url,
 )
 
 
@@ -154,10 +156,10 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
                     "type": "tracks",
                     "meta": {"addedAt": "2021-05-12T14:32:10Z"},
                 }],
-                "links": {
+                    "links": {
                     "next": (
-                        f"{TIDAL_OPENAPI_BASE_URL}/userCollectionTracks/me/"
-                        "relationships/items?page%5Bcursor%5D=second"
+                        "/userCollectionTracks/me/relationships/items"
+                        "?page%5Bcursor%5D=second"
                     )
                 },
             })
@@ -243,3 +245,21 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
         )
         for request in provider_requests
     )
+
+
+@pytest.mark.parametrize(
+    "unsafe_link",
+    [
+        "https://evil.example/v2/steal",
+        "//evil.example/v2/steal",
+        "https://openapi.tidal.com.evil.example/v2/steal",
+        "https://openapi.tidal.com:444/v2/steal",
+        "https://openapi.tidal.com/not-v2/steal",
+    ],
+)
+def test_openapi_pagination_rejects_untrusted_destinations(unsafe_link):
+    with pytest.raises(TidalAPIError, match="unsafe pagination link"):
+        _safe_next_url(
+            unsafe_link,
+            f"{TIDAL_OPENAPI_BASE_URL}/userCollectionTracks/me/relationships/items",
+        )

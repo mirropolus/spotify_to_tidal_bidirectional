@@ -9,7 +9,7 @@ import hashlib
 import re
 import secrets
 from typing import Any, Iterable
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
 
@@ -178,21 +178,40 @@ def _batches(values: list[str], size: int) -> Iterable[list[str]]:
         yield values[start:start + size]
 
 
-def _safe_next_url(value: Any) -> str | None:
-    if value is None:
+def _safe_next_url(value: Any, current_url: str) -> str | None:
+    if value is None or value == "":
         return None
     if not isinstance(value, str):
         raise TidalAPIError("Tidal returned an invalid pagination link")
-    parsed = urlparse(value)
+
+    parsed_value = urlparse(value)
+    if parsed_value.scheme or parsed_value.netloc:
+        candidate = value
+    elif value.startswith("//"):
+        raise TidalAPIError("Tidal returned an unsafe pagination link")
+    elif value.startswith("?"):
+        candidate = urljoin(current_url, value)
+    elif value.startswith("/v2/"):
+        candidate = f"https://openapi.tidal.com{value}"
+    else:
+        candidate = f"{TIDAL_OPENAPI_BASE_URL}/{value.lstrip('/')}"
+
+    parsed = urlparse(candidate)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise TidalAPIError("Tidal returned an unsafe pagination link") from exc
     if (
         parsed.scheme != "https"
         or parsed.hostname != "openapi.tidal.com"
+        or port not in {None, 443}
         or not parsed.path.startswith("/v2/")
         or parsed.username
         or parsed.password
+        or parsed.fragment
     ):
         raise TidalAPIError("Tidal returned an unsafe pagination link")
-    return value
+    return candidate
 
 
 class TidalOpenAPIClient:
@@ -249,6 +268,7 @@ class TidalOpenAPIClient:
         try:
             async with httpx.AsyncClient(timeout=20, transport=self._transport) as client:
                 while url:
+                    current_url = url
                     response = await client.get(url, params=params, headers=user_headers)
                     response.raise_for_status()
                     payload = response.json()
@@ -261,7 +281,10 @@ class TidalOpenAPIClient:
                             str(item["id"]),
                             _parse_datetime((item.get("meta") or {}).get("addedAt")),
                         ))
-                    url = _safe_next_url((payload.get("links") or {}).get("next"))
+                    url = _safe_next_url(
+                        (payload.get("links") or {}).get("next"),
+                        current_url,
+                    )
                     params = None
 
                 if not collection:
