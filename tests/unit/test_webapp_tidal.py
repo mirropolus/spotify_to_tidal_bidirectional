@@ -17,6 +17,7 @@ from spotify_to_tidal.webapp.tidal_auth import (
     exchange_authorization_code,
     generate_pkce_verifier,
     pkce_s256,
+    _retry_after_seconds,
     _safe_next_url,
 )
 
@@ -245,6 +246,128 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
         )
         for request in provider_requests
     )
+
+
+def test_retry_after_supports_delay_seconds_and_http_date():
+    now = datetime.datetime(2026, 8, 24, 12, 0, tzinfo=datetime.timezone.utc)
+
+    assert _retry_after_seconds("7", now=now) == 7.0
+    assert _retry_after_seconds(
+        "Mon, 24 Aug 2026 12:00:09 GMT",
+        now=now,
+    ) == 9.0
+    assert _retry_after_seconds("not-a-delay", now=now) is None
+
+
+def test_openapi_collection_retries_429_and_honors_retry_after(mocker):
+    collection_requests = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal collection_requests
+        if request.url.path.endswith("/userCollectionTracks/me/relationships/items"):
+            collection_requests += 1
+            if collection_requests == 1:
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "2"},
+                    json={"errors": [{"status": "429"}]},
+                )
+            return httpx.Response(200, json={"data": [], "links": {"next": None}})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    sleep = mocker.patch(
+        "spotify_to_tidal.webapp.tidal_auth.asyncio.sleep",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch("spotify_to_tidal.webapp.tidal_auth.random.random", return_value=0.0)
+    client = TidalOpenAPIClient(
+        TidalCredentials(
+            access_token="user-token",
+            refresh_token=None,
+            token_type="Bearer",
+            expires_at=None,
+            scope="collection.read",
+        ),
+        "client-id",
+        "client-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    assert asyncio.run(client.favorite_tracks()) == []
+    assert collection_requests == 2
+    sleep.assert_awaited_once_with(2.0)
+
+
+def test_openapi_collection_reports_429_after_bounded_retries(mocker):
+    requests = 0
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        return httpx.Response(429, json={"secret": "not-disclosed"})
+
+    sleep = mocker.patch(
+        "spotify_to_tidal.webapp.tidal_auth.asyncio.sleep",
+        new=mocker.AsyncMock(),
+    )
+    mocker.patch("spotify_to_tidal.webapp.tidal_auth.random.random", return_value=0.0)
+    client = TidalOpenAPIClient(
+        TidalCredentials(
+            access_token="user-token",
+            refresh_token=None,
+            token_type="Bearer",
+            expires_at=None,
+            scope="collection.read",
+        ),
+        "client-id",
+        "client-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TidalAPIError) as exc_info:
+        asyncio.run(client.favorite_tracks())
+
+    assert str(exc_info.value) == (
+        "Tidal collection page request failed after 3 retries (HTTP 429)"
+    )
+    assert "not-disclosed" not in str(exc_info.value)
+    assert requests == 4
+    assert sleep.await_count == 3
+
+
+def test_openapi_collection_does_not_wait_on_excessive_retry_after(mocker):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "3600"},
+            json={"secret": "not-disclosed"},
+        )
+
+    sleep = mocker.patch(
+        "spotify_to_tidal.webapp.tidal_auth.asyncio.sleep",
+        new=mocker.AsyncMock(),
+    )
+    client = TidalOpenAPIClient(
+        TidalCredentials(
+            access_token="user-token",
+            refresh_token=None,
+            token_type="Bearer",
+            expires_at=None,
+            scope="collection.read",
+        ),
+        "client-id",
+        "client-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TidalAPIError) as exc_info:
+        asyncio.run(client.favorite_tracks())
+
+    assert str(exc_info.value) == (
+        "Tidal collection page request was rate limited; try again in 3600 seconds"
+    )
+    assert "not-disclosed" not in str(exc_info.value)
+    sleep.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

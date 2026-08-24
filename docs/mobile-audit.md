@@ -104,6 +104,13 @@ Because sessions are stored in process memory, do not start multiple Uvicorn
 workers. Restarting the process intentionally disconnects every session and
 removes every generated report.
 
+Tidal may temporarily return HTTP `429` while a large collection is being
+read. The audit retries read-only `GET` requests up to three times with
+exponential backoff and jitter, and honors a reasonable `Retry-After` response
+header. If Tidal asks for a wait longer than one minute, the request stops
+instead of keeping the browser connection open and the page shows how many
+seconds to wait before running the audit again. No partial report is retained.
+
 ## 3. Run with Docker
 
 Build the image:

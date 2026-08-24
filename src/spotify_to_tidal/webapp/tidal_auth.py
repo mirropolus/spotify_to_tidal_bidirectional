@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 from dataclasses import dataclass
 import datetime
+from email.utils import parsedate_to_datetime
 import hashlib
+import math
+import random
 import re
 import secrets
 from typing import Any, Iterable
@@ -19,6 +23,10 @@ TIDAL_TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 TIDAL_OPENAPI_BASE_URL = "https://openapi.tidal.com/v2"
 TIDAL_AUDIT_SCOPES = ("collection.read",)
 TIDAL_CATALOG_BATCH_SIZE = 50
+TIDAL_STATUS_MAX_RETRIES = 3
+TIDAL_STATUS_RETRY_BASE_SECONDS = 0.5
+TIDAL_STATUS_RETRY_MAX_SECONDS = 16.0
+TIDAL_RETRY_AFTER_MAX_WAIT_SECONDS = 60.0
 _JSON_API_MEDIA_TYPE = "application/vnd.api+json"
 _DURATION_PATTERN = re.compile(
     r"^P(?:(?P<days>\d+(?:\.\d+)?)D)?(?:T(?:(?P<hours>\d+(?:\.\d+)?)H)?"
@@ -178,6 +186,29 @@ def _batches(values: list[str], size: int) -> Iterable[list[str]]:
         yield values[start:start + size]
 
 
+def _retry_after_seconds(
+    value: str | None,
+    *,
+    now: datetime.datetime | None = None,
+) -> float | None:
+    """Parse Retry-After delay-seconds or HTTP-date without reading a body."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if stripped.isdigit():
+        return float(stripped)
+    try:
+        retry_at = parsedate_to_datetime(stripped)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+        retry_at = retry_at.replace(tzinfo=datetime.timezone.utc)
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    if current.tzinfo is None or current.utcoffset() is None:
+        current = current.replace(tzinfo=datetime.timezone.utc)
+    return max(0.0, (retry_at - current.astimezone(datetime.timezone.utc)).total_seconds())
+
+
 def _safe_next_url(value: Any, current_url: str) -> str | None:
     if value is None or value == "":
         return None
@@ -231,6 +262,41 @@ class TidalOpenAPIClient:
         self._transport = transport
         self._catalog_token: str | None = None
 
+    async def _get_with_retry(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        stage: str,
+        params: Any = None,
+        headers: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        """Retry only read-only requests using TIDAL SDK-style status backoff."""
+        retries = 0
+        while True:
+            response = await client.get(url, params=params, headers=headers)
+            retryable = response.status_code == 429 or 500 <= response.status_code < 600
+            if not retryable or retries >= TIDAL_STATUS_MAX_RETRIES:
+                return response
+
+            jitter = 0.8 + random.random() * 0.2
+            backoff = min(
+                TIDAL_STATUS_RETRY_BASE_SECONDS * (2 ** retries) * jitter,
+                TIDAL_STATUS_RETRY_MAX_SECONDS,
+            )
+            retry_after = _retry_after_seconds(response.headers.get("Retry-After"))
+            if (
+                response.status_code == 429
+                and retry_after is not None
+                and retry_after > TIDAL_RETRY_AFTER_MAX_WAIT_SECONDS
+            ):
+                wait_seconds = math.ceil(retry_after)
+                raise TidalAPIError(
+                    f"{stage} was rate limited; try again in {wait_seconds} seconds"
+                )
+            await asyncio.sleep(max(backoff, retry_after or 0.0))
+            retries += 1
+
     async def _catalog_access_token(self, client: httpx.AsyncClient) -> str:
         if self._catalog_token:
             return self._catalog_token
@@ -277,10 +343,22 @@ class TidalOpenAPIClient:
             async with httpx.AsyncClient(timeout=20, transport=self._transport) as client:
                 while url:
                     current_url = url
-                    response = await client.get(url, params=params, headers=user_headers)
+                    response = await self._get_with_retry(
+                        client,
+                        url,
+                        stage=stage,
+                        params=params,
+                        headers=user_headers,
+                    )
                     if response.is_error:
+                        retry_suffix = (
+                            f" after {TIDAL_STATUS_MAX_RETRIES} retries"
+                            if response.status_code == 429
+                            or 500 <= response.status_code < 600
+                            else ""
+                        )
                         raise TidalAPIError(
-                            f"{stage} failed (HTTP {response.status_code})"
+                            f"{stage} failed{retry_suffix} (HTTP {response.status_code})"
                         )
                     payload = response.json()
                     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
@@ -312,14 +390,22 @@ class TidalOpenAPIClient:
                     stage = "Tidal catalog metadata request"
                     query: list[tuple[str, str]] = [("filter[id]", item) for item in batch]
                     query.append(("include", "artists"))
-                    response = await client.get(
+                    response = await self._get_with_retry(
+                        client,
                         f"{TIDAL_OPENAPI_BASE_URL}/tracks",
+                        stage=stage,
                         params=query,
                         headers=catalog_headers,
                     )
                     if response.is_error:
+                        retry_suffix = (
+                            f" after {TIDAL_STATUS_MAX_RETRIES} retries"
+                            if response.status_code == 429
+                            or 500 <= response.status_code < 600
+                            else ""
+                        )
                         raise TidalAPIError(
-                            f"{stage} failed (HTTP {response.status_code})"
+                            f"{stage} failed{retry_suffix} (HTTP {response.status_code})"
                         )
                     payload = response.json()
                     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
