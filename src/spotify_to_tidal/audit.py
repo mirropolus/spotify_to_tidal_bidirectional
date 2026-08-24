@@ -267,6 +267,31 @@ async def audit_favorites(
     output_path: str | Path,
 ) -> Path:
     """Audit both favorites libraries and write a local CSV; account writes are forbidden."""
+    rows = await collect_favorites_audit_rows(
+        spotify_session,
+        tidal_session,
+        config,
+    )
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", newline="", encoding="utf-8") as report:
+        writer = csv.DictWriter(report, fieldnames=AUDIT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    counts = Counter(row["status"] for row in rows)
+    summary = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
+    print(f"Favorites audit written to {destination} ({summary})")
+    return destination
+
+
+async def collect_favorites_audit_rows(
+    spotify_session: spotipy.Spotify,
+    tidal_session: tidalapi.Session,
+    config: dict,
+) -> list[dict]:
+    """Collect a read-only favorites audit without persisting the resulting report."""
     print("Loading favorite tracks from Tidal (read-only audit)")
     tidal_tracks = await repeat_on_request_error(
         get_all_favorites,
@@ -286,25 +311,13 @@ async def audit_favorites(
         tidal_unmatched,
         config,
     )
-    rows = build_favorites_audit_rows(
+    return build_favorites_audit_rows(
         tidal_tracks,
         spotify_items,
         catalog_matches,
         mismatch_days=config.get("audit_timestamp_mismatch_days", 30),
         cluster_size=config.get("audit_timestamp_cluster_size", 3),
     )
-
-    destination = Path(output_path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("w", newline="", encoding="utf-8") as report:
-        writer = csv.DictWriter(report, fieldnames=AUDIT_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-    counts = Counter(row["status"] for row in rows)
-    summary = ", ".join(f"{status}={count}" for status, count in sorted(counts.items()))
-    print(f"Favorites audit written to {destination} ({summary})")
-    return destination
 
 
 def audit_favorites_wrapper(

@@ -1,0 +1,13 @@
+.git
+.cache*
+.env*
+!.env.audit.example
+.session.yml
+.venv
+config.yml
+config.yaml
+favorites_audit*.csv
+__pycache__
+.pytest_cache
+.hypothesis
+*.pyc

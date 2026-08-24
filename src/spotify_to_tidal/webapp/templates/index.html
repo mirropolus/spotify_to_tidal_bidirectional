@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#101510">
+    <meta name="description" content="Read-only Spotify and Tidal favorites audit">
+    <link rel="manifest" href="/static/manifest.webmanifest">
+    <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/static/app.css">
+    <title>Favorite Bridge Audit</title>
+  </head>
+  <body data-tidal-pending="{{ 'true' if tidal_status == 'pending' else 'false' }}">
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand-mark" aria-hidden="true">FB</div>
+        <div>
+          <p class="eyebrow">Private library check</p>
+          <h1>Favorite Bridge Audit</h1>
+        </div>
+        <span class="readonly-badge">Read-only</span>
+      </header>
+
+      <section class="intro" aria-labelledby="intro-heading">
+        <div>
+          <h2 id="intro-heading">Compare first. Change nothing.</h2>
+          <p>Connect both services, inspect matching and timestamp anomalies, then download a local CSV. This application has no synchronization or deletion routes.</p>
+        </div>
+        <ol class="steps" aria-label="Audit steps">
+          <li><span>1</span> Connect</li>
+          <li><span>2</span> Audit</li>
+          <li><span>3</span> Download</li>
+        </ol>
+      </section>
+
+      {% if notice %}<p class="notice" role="status">{{ notice }}</p>{% endif %}
+      {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+
+      <section class="connections" aria-label="Service connections">
+        <article class="service-card spotify-card">
+          <div class="service-heading">
+            <div>
+              <p class="service-label">Service 01</p>
+              <h2>Spotify</h2>
+            </div>
+            <span class="status {{ 'connected' if spotify_connected else 'disconnected' }}">
+              {{ 'Connected' if spotify_connected else 'Not connected' }}
+            </span>
+          </div>
+          <p>Requests only <code>user-library-read</code>. PKCE keeps the flow free of a browser-side client secret.</p>
+          {% if spotify_connected %}
+          <form method="post" action="/auth/spotify/disconnect">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button secondary" type="submit">Disconnect Spotify</button>
+          </form>
+          {% elif spotify_configured %}
+          <a class="button spotify" href="/auth/spotify/start">Connect Spotify</a>
+          {% else %}
+          <p class="configuration-note">Operator setup required: <code>SPOTIFY_CLIENT_ID</code>.</p>
+          {% endif %}
+        </article>
+
+        <article class="service-card tidal-card">
+          <div class="service-heading">
+            <div>
+              <p class="service-label">Service 02</p>
+              <h2>Tidal</h2>
+            </div>
+            <span class="status {{ 'connected' if tidal_status == 'connected' else 'pending' if tidal_status == 'pending' else 'disconnected' }}">
+              {{ 'Connected' if tidal_status == 'connected' else 'Waiting' if tidal_status == 'pending' else 'Not connected' }}
+            </span>
+          </div>
+          <p>Uses Tidal device authorization with the read-only <code>r_usr</code> scope.</p>
+          {% if tidal_status == 'connected' %}
+          <form method="post" action="/auth/tidal/disconnect">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button secondary" type="submit">Disconnect Tidal</button>
+          </form>
+          {% elif tidal_status == 'pending' %}
+          <div class="device-code">
+            <span>Authorization code</span>
+            <strong>{{ tidal_code }}</strong>
+          </div>
+          <a class="button tidal" href="{{ tidal_url }}" rel="noreferrer">Open Tidal authorization</a>
+          <p class="polling">Waiting securely for approval…</p>
+          {% elif tidal_configured %}
+          <form method="post" action="/auth/tidal/start">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+            <button class="button tidal" type="submit">Connect Tidal</button>
+          </form>
+          {% else %}
+          <p class="configuration-note">Operator setup required: <code>TIDAL_CLIENT_ID</code> and <code>TIDAL_CLIENT_SECRET</code>.</p>
+          {% endif %}
+        </article>
+      </section>
+
+      <section class="audit-panel" aria-labelledby="audit-heading">
+        <div class="audit-copy">
+          <p class="eyebrow">Library comparison</p>
+          <h2 id="audit-heading">Run a fresh audit</h2>
+          <p>Catalog searches are allowed; likes, favorites and playlists are never modified.</p>
+        </div>
+        <form method="post" action="/audit">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="button primary" type="submit" {% if not can_audit %}disabled{% endif %}>Run read-only audit</button>
+        </form>
+      </section>
+
+      {% if audit_counts %}
+      <section class="results" aria-labelledby="results-heading">
+        <div class="results-heading">
+          <div>
+            <p class="eyebrow">Generated {{ audit_generated_at }}</p>
+            <h2 id="results-heading">Audit results</h2>
+          </div>
+          <a class="button download" href="/favorites_audit.csv">Download CSV</a>
+        </div>
+        <div class="metrics">
+          <div><strong>{{ audit_counts.get('matched', 0) }}</strong><span>Matched</span></div>
+          <div><strong>{{ audit_counts.get('tidal_only', 0) }}</strong><span>Tidal only</span></div>
+          <div><strong>{{ audit_counts.get('spotify_only', 0) }}</strong><span>Spotify only</span></div>
+          <div><strong>{{ audit_counts.get('timestamp_mismatch', 0) }}</strong><span>Timestamp alerts</span></div>
+          <div><strong>{{ audit_counts.get('match_failed', 0) }}</strong><span>Failed matches</span></div>
+        </div>
+
+        {% if audit_preview %}
+        <div class="preview-list">
+          <h3>Items requiring attention</h3>
+          {% for row in audit_preview %}
+          <article>
+            <div>
+              <strong>{{ row.artist }} — {{ row.title }}</strong>
+              <span>{{ row.status.replace('_', ' ') }}</span>
+            </div>
+            <small>{{ row.timestamp_suspect_reason or 'No additional reason' }}</small>
+          </article>
+          {% endfor %}
+        </div>
+        {% endif %}
+      </section>
+      {% endif %}
+
+      <footer>
+        <p>Tokens and generated CSV data live only in this server process and expire with the session.</p>
+        <form method="post" action="/session/delete">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button class="text-button" type="submit">Delete this session now</button>
+        </form>
+      </footer>
+    </main>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

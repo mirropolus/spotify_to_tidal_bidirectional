@@ -290,6 +290,37 @@ until it is reviewed separately.
 
 ---
 
+## Mobile read-only audit app
+
+The optional **Favorite Bridge Audit** PWA provides a phone-friendly OAuth and
+audit flow without asking users to copy access or refresh tokens. It connects
+to Spotify with PKCE and `user-library-read`, connects to Tidal with device
+authorization limited to `r_usr`, runs the existing favorites audit, and lets
+the user download `favorites_audit.csv`.
+
+It contains no synchronization or library-write routes. Tokens and generated
+reports remain only in process memory and expire with the browser session.
+
+Install and start it locally with:
+
+```bash
+python -m pip install -e ".[web]"
+export AUDIT_WEB_BASE_URL=http://127.0.0.1:8765
+export SPOTIFY_CLIENT_ID=your_spotify_client_id
+export TIDAL_CLIENT_ID=your_tidal_client_id
+export TIDAL_CLIENT_SECRET=your_tidal_client_secret
+spotify_to_tidal_web
+```
+
+Register `http://127.0.0.1:8765/auth/spotify/callback` as the Spotify redirect
+URI, open `http://127.0.0.1:8765`, connect both accounts and run the audit.
+
+See [the mobile audit application guide](docs/mobile-audit.md) for provider
+registration, Docker usage, mobile/HTTPS deployment, CSV fields and security
+limitations.
+
+---
+
 ## All configuration options
 
 See `example_config.yml` for a full list of options with comments, and run `python3.11 -m spotify_to_tidal --help` for all CLI flags.
