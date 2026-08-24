@@ -294,9 +294,12 @@ until it is reviewed separately.
 
 The optional **Favorite Bridge Audit** PWA provides a phone-friendly OAuth and
 audit flow without asking users to copy access or refresh tokens. It connects
-to Spotify with PKCE and `user-library-read`, connects to Tidal with device
-authorization limited to `r_usr`, runs the existing favorites audit, and lets
-the user download `favorites_audit.csv`.
+to Spotify with PKCE and `user-library-read`, and to Tidal with Authorization
+Code + PKCE limited to the public read-only `collection.read` scope. Tidal
+favorites and their historical timestamps are loaded through the official
+OpenAPI `userCollectionTracks` relationship; the PWA does not use Tidal Device
+Login or legacy `tidalapi` favorites endpoints. It then runs the existing
+matching audit and lets the user download `favorites_audit.csv`.
 
 It contains no synchronization or library-write routes. Tokens and generated
 reports remain only in process memory and expire with the browser session.
@@ -312,8 +315,14 @@ export TIDAL_CLIENT_SECRET=your_tidal_client_secret
 spotify_to_tidal_web
 ```
 
-Register `http://127.0.0.1:8765/auth/spotify/callback` as the Spotify redirect
-URI, open `http://127.0.0.1:8765`, connect both accounts and run the audit.
+Register these exact redirect URIs in the respective developer dashboards:
+
+- Spotify: `http://127.0.0.1:8765/auth/spotify/callback`
+- Tidal: `http://127.0.0.1:8765/auth/tidal/callback`
+
+Open `http://127.0.0.1:8765`, connect both accounts and run the audit. Hosted
+deployments must register the same callback paths under their exact HTTPS
+`AUDIT_WEB_BASE_URL` origin.
 
 See [the mobile audit application guide](docs/mobile-audit.md) for provider
 registration, Docker usage, mobile/HTTPS deployment, CSV fields and security

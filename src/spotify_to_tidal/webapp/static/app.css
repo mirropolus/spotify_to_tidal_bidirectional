@@ -180,19 +180,6 @@ code {
 
 .configuration-note { font-size: 0.88rem; }
 
-.device-code {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin: 16px 0;
-  padding: 12px;
-  border: 1px dashed #617065;
-  border-radius: 10px;
-}
-.device-code span { color: var(--muted); font-size: 0.8rem; }
-.device-code strong { letter-spacing: 0.09em; }
-.polling { margin-bottom: 0; font-size: 0.82rem; }
-
 .audit-panel {
   display: flex;
   align-items: end;

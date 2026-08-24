@@ -10,7 +10,7 @@
     <link rel="stylesheet" href="/static/app.css">
     <title>Favorite Bridge Audit</title>
   </head>
-  <body data-tidal-pending="{{ 'true' if tidal_status == 'pending' else 'false' }}">
+  <body>
     <main class="shell">
       <header class="topbar">
         <div class="brand-mark" aria-hidden="true">FB</div>
@@ -66,23 +66,16 @@
               <p class="service-label">Service 02</p>
               <h2>Tidal</h2>
             </div>
-            <span class="status {{ 'connected' if tidal_status == 'connected' else 'pending' if tidal_status == 'pending' else 'disconnected' }}">
-              {{ 'Connected' if tidal_status == 'connected' else 'Waiting' if tidal_status == 'pending' else 'Not connected' }}
+            <span class="status {{ 'connected' if tidal_status == 'connected' else 'disconnected' }}">
+              {{ 'Connected' if tidal_status == 'connected' else 'Not connected' }}
             </span>
           </div>
-          <p>Uses Tidal device authorization with the read-only <code>r_usr</code> scope.</p>
+          <p>Uses Tidal Authorization Code with PKCE and only the public read-only <code>collection.read</code> scope.</p>
           {% if tidal_status == 'connected' %}
           <form method="post" action="/auth/tidal/disconnect">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <button class="button secondary" type="submit">Disconnect Tidal</button>
           </form>
-          {% elif tidal_status == 'pending' %}
-          <div class="device-code">
-            <span>Authorization code</span>
-            <strong>{{ tidal_code }}</strong>
-          </div>
-          <a class="button tidal" href="{{ tidal_url }}" rel="noreferrer">Open Tidal authorization</a>
-          <p class="polling">Waiting securely for approval…</p>
           {% elif tidal_configured %}
           <form method="post" action="/auth/tidal/start">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">

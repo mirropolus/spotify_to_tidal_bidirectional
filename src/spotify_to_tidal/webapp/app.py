@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import spotipy
@@ -26,8 +26,13 @@ from spotipy.cache_handler import MemoryCacheHandler
 from spotipy.oauth2 import SpotifyPKCE
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from ..audit import AUDIT_FIELDS, collect_favorites_audit_rows
-from .tidal_auth import new_read_only_tidal_session
+from ..audit import AUDIT_FIELDS, collect_favorites_audit_rows_from_tracks
+from .tidal_auth import (
+    TidalOpenAPIClient,
+    build_authorization_url,
+    exchange_authorization_code,
+    generate_pkce_verifier,
+)
 
 
 COOKIE_NAME = "favorite_bridge_session"
@@ -87,9 +92,9 @@ class BrowserSession:
     spotify_state: str | None = None
     spotify_oauth: SpotifyPKCE | None = None
     spotify_session: Any | None = None
-    tidal_session: Any | None = None
-    tidal_link: Any | None = None
-    tidal_future: Any | None = None
+    tidal_state: str | None = None
+    tidal_code_verifier: str | None = None
+    tidal_client: TidalOpenAPIClient | None = None
     audit_csv: bytes | None = None
     audit_counts: dict[str, int] = field(default_factory=dict)
     audit_preview: list[dict] = field(default_factory=list)
@@ -134,9 +139,7 @@ class MemorySessionStore:
         if not session_id:
             return
         with self._lock:
-            state = self._sessions.pop(session_id, None)
-        if state and state.tidal_future and not state.tidal_future.done():
-            state.tidal_future.cancel()
+            self._sessions.pop(session_id, None)
 
 
 def _csv_bytes(rows: list[dict]) -> bytes:
@@ -145,16 +148,6 @@ def _csv_bytes(rows: list[dict]) -> bytes:
     writer.writeheader()
     writer.writerows(rows)
     return report.getvalue().encode("utf-8-sig")
-
-
-def _safe_tidal_url(value: str) -> str:
-    candidate = value if value.startswith("https://") else f"https://{value}"
-    parsed = urlparse(candidate)
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise ValueError("Invalid Tidal authorization URL")
-    if parsed.hostname != "link.tidal.com" and not parsed.hostname.endswith(".tidal.com"):
-        raise ValueError("Unexpected Tidal authorization host")
-    return candidate
 
 
 def create_app(
@@ -214,31 +207,10 @@ def create_app(
         if not hmac.compare_digest(supplied, state.csrf_token):
             raise HTTPException(status_code=403, detail="Invalid request token")
 
-    def finish_tidal_login(state: BrowserSession) -> str:
-        if state.tidal_future is None:
-            return "connected" if state.tidal_session is not None else "disconnected"
-        if not state.tidal_future.done():
-            return "pending"
-        try:
-            state.tidal_future.result()
-            if not state.tidal_session.check_login():
-                raise RuntimeError("Tidal login check failed")
-            state.tidal_link = None
-            state.tidal_future = None
-            state.clear_report()
-            state.notice = "Tidal connected with read-only authorization."
-            return "connected"
-        except Exception:
-            state.tidal_session = None
-            state.tidal_link = None
-            state.tidal_future = None
-            state.error = "Tidal authorization failed or expired. Start it again."
-            return "error"
-
     @app.get("/", response_class=HTMLResponse)
     async def home(request: Request):
         session_id, state, _ = browser_state(request)
-        tidal_status = finish_tidal_login(state)
+        tidal_status = "connected" if state.tidal_client is not None else "disconnected"
         notice, error = state.notice, state.error
         state.notice = None
         state.error = None
@@ -251,11 +223,6 @@ def create_app(
                 "spotify_configured": bool(settings.spotify_client_id),
                 "tidal_status": tidal_status,
                 "tidal_configured": bool(settings.tidal_client_id and settings.tidal_client_secret),
-                "tidal_url": (
-                    _safe_tidal_url(state.tidal_link.verification_uri_complete)
-                    if state.tidal_link else None
-                ),
-                "tidal_code": state.tidal_link.user_code if state.tidal_link else None,
                 "can_audit": state.spotify_session is not None and tidal_status == "connected",
                 "audit_counts": state.audit_counts,
                 "audit_preview": state.audit_preview,
@@ -348,33 +315,66 @@ def create_app(
             raise HTTPException(status_code=503, detail="Tidal is not configured")
         session_id, state, _ = browser_state(request)
         await require_csrf(request, state)
-        if state.tidal_future and not state.tidal_future.done():
-            state.error = "A Tidal authorization is already pending."
-        else:
-            try:
-                tidal_session = new_read_only_tidal_session(
-                    settings.tidal_client_id,
-                    settings.tidal_client_secret,
-                )
-                link, future = tidal_session.login_oauth()
-                _safe_tidal_url(link.verification_uri_complete)
-                state.tidal_session = tidal_session
-                state.tidal_link = link
-                state.tidal_future = future
-                state.clear_report()
-            except Exception:
-                state.tidal_session = None
-                state.tidal_link = None
-                state.tidal_future = None
-                state.error = "Could not start Tidal authorization."
-        response = RedirectResponse("/", status_code=303)
+        oauth_state = secrets.token_urlsafe(32)
+        code_verifier = generate_pkce_verifier()
+        redirect_uri = f"{settings.base_url}/auth/tidal/callback"
+        state.tidal_state = oauth_state
+        state.tidal_code_verifier = code_verifier
+        state.tidal_client = None
+        state.clear_report()
+        response = RedirectResponse(
+            build_authorization_url(
+                settings.tidal_client_id,
+                redirect_uri,
+                oauth_state,
+                code_verifier,
+            ),
+            status_code=303,
+        )
         attach_cookie(response, session_id)
         return response
 
-    @app.get("/auth/tidal/status")
-    async def tidal_status(request: Request):
-        session_id, state, _ = browser_state(request)
-        response = JSONResponse({"status": finish_tidal_login(state)})
+    @app.get("/auth/tidal/callback")
+    async def tidal_callback(
+        request: Request,
+        code: str | None = None,
+        state: str | None = None,
+        error: str | None = None,
+    ):
+        session_id, browser, _ = browser_state(request)
+        valid_state = (
+            state is not None
+            and browser.tidal_state is not None
+            and hmac.compare_digest(state, browser.tidal_state)
+        )
+        if not valid_state:
+            browser.error = "Tidal authorization was cancelled or invalid."
+        elif error or not code or not browser.tidal_code_verifier:
+            browser.tidal_client = None
+            browser.error = "Tidal authorization was cancelled or invalid."
+        else:
+            try:
+                credentials = await exchange_authorization_code(
+                    client_id=settings.tidal_client_id or "",
+                    client_secret=settings.tidal_client_secret or "",
+                    code=code,
+                    code_verifier=browser.tidal_code_verifier,
+                    redirect_uri=f"{settings.base_url}/auth/tidal/callback",
+                )
+                browser.tidal_client = TidalOpenAPIClient(
+                    credentials,
+                    settings.tidal_client_id or "",
+                    settings.tidal_client_secret or "",
+                )
+                browser.notice = "Tidal connected with read-only authorization."
+                browser.clear_report()
+            except Exception:
+                browser.tidal_client = None
+                browser.error = "Tidal authorization failed. Start it again."
+        if valid_state:
+            browser.tidal_state = None
+            browser.tidal_code_verifier = None
+        response = RedirectResponse("/", status_code=303)
         attach_cookie(response, session_id)
         return response
 
@@ -382,11 +382,9 @@ def create_app(
     async def tidal_disconnect(request: Request):
         session_id, state, _ = browser_state(request)
         await require_csrf(request, state)
-        if state.tidal_future and not state.tidal_future.done():
-            state.tidal_future.cancel()
-        state.tidal_session = None
-        state.tidal_link = None
-        state.tidal_future = None
+        state.tidal_state = None
+        state.tidal_code_verifier = None
+        state.tidal_client = None
         state.clear_report()
         state.notice = "Tidal disconnected."
         response = RedirectResponse("/", status_code=303)
@@ -397,12 +395,13 @@ def create_app(
     async def run_audit(request: Request):
         session_id, state, _ = browser_state(request)
         await require_csrf(request, state)
-        if state.spotify_session is None or state.tidal_session is None:
+        if state.spotify_session is None or state.tidal_client is None:
             raise HTTPException(status_code=409, detail="Connect both services first")
         try:
-            rows = await collect_favorites_audit_rows(
+            tidal_tracks = await state.tidal_client.favorite_tracks()
+            rows = await collect_favorites_audit_rows_from_tracks(
                 state.spotify_session,
-                state.tidal_session,
+                tidal_tracks,
                 {
                     "audit_timestamp_mismatch_days": settings.mismatch_days,
                     "audit_timestamp_cluster_size": settings.cluster_size,

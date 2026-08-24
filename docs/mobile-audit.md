@@ -9,7 +9,8 @@ The web app is deliberately audit-only:
 
 - Spotify requests only `user-library-read` through Authorization Code with
   PKCE.
-- Tidal device authorization requests only `r_usr`.
+- Tidal uses Authorization Code with PKCE (S256) and requests exactly the
+  third-party read-only scope `collection.read`.
 - There are no sync, playlist, unlike, delete-favorite, or library-write
   routes.
 - Provider tokens, OAuth state and generated CSV bytes are stored only in the
@@ -37,14 +38,35 @@ for example `https://audit.example.org/auth/spotify/callback`.
 
 ### Tidal
 
-1. Sign in to the Tidal Developer Portal and create an application.
-2. Copy its Client ID and Client Secret.
-3. Keep the secret only in the server environment. Never put it in frontend
-   JavaScript, the repository, an image, or a mobile application bundle.
+1. Sign in to the [Tidal Developer Portal](https://developer.tidal.com/) and
+   create an application. Tidal's official
+   [authorization guide](https://developer.tidal.com/documentation/api-sdk/api-sdk-authorization)
+   describes the Authorization Code + PKCE flow used here.
+2. Add this exact redirect URI for the local example:
 
-The current implementation uses Tidal's device authorization endpoint through
-`tidalapi`, but replaces that library's bundled credentials with the
-operator-owned credentials and narrows the requested scope to `r_usr`.
+   `http://127.0.0.1:8765/auth/tidal/callback`
+
+3. Copy its Client ID and Client Secret.
+4. Keep the secret only in the server environment. Never put it in frontend
+   JavaScript, the repository, an image, or a mobile application bundle.
+5. If the Developer Dashboard asks which permissions the application uses,
+   enable only My Collection read access (`collection.read`). Do not enable
+   `collection.write`, playlist-write, or any other write permission.
+
+For a hosted installation, register the exact HTTPS callback for that origin,
+for example `https://audit.example.org/auth/tidal/callback`. It must exactly
+match `AUDIT_WEB_BASE_URL` plus `/auth/tidal/callback`.
+
+The audit uses Tidal's officially supported Authorization Code flow with PKCE
+S256. It reads historical favorite timestamps from the official OpenAPI
+relationship:
+
+`GET /v2/userCollectionTracks/me/relationships/items`
+
+Catalog metadata is fetched with read-only `GET /v2/tracks` calls using the
+application's client-credentials token. The user token is used only for My
+Collection. The web path does not use `tidalapi`, legacy `api.tidal.com/v1`
+favorites, the internal-only Device Login flow, or the internal `r_usr` scope.
 
 ## 2. Run locally
 
@@ -115,7 +137,8 @@ mobile browser as a PWA. The safest options are:
 For a hosted origin:
 
 - HTTPS is mandatory;
-- update the Spotify redirect URI to exactly match the hosted callback;
+- update both Spotify and Tidal redirect URIs to exactly match their hosted
+  callbacks;
 - keep the deployment single-process unless sessions are moved to an encrypted
   shared store;
 - disable query-string logging for the OAuth callback at the reverse proxy;
@@ -145,6 +168,8 @@ writes and remains outside this application.
 - It does not transfer provider tokens into GitHub Actions Secrets.
 - It does not persist refresh tokens, so users reconnect after a process restart
   or session expiry.
+- OAuth state and the PKCE verifier are single-use and are discarded after the
+  callback, whether authorization succeeds or fails.
 - Spotify's timestamp-preserving write endpoint is deprecated. The audit app
   does not call it, but a later synchronization UI must validate endpoint access
   for newly registered Spotify applications before enabling writes.

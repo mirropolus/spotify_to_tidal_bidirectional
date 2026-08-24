@@ -1,71 +1,331 @@
-"""Read-only Tidal device authorization for the audit web application."""
+"""Official, read-only Tidal OAuth and OpenAPI support for the web audit."""
 
 from __future__ import annotations
 
-import time
+import base64
+from dataclasses import dataclass
+import datetime
+import hashlib
+import re
+import secrets
+from typing import Any, Iterable
+from urllib.parse import urlencode, urlparse
 
-import tidalapi
-from tidalapi.session import LinkLogin
+import httpx
 
 
-class ReadOnlyTidalSession(tidalapi.Session):
-    """Tidal session whose device grant requests only user-library read access."""
+TIDAL_AUTHORIZE_URL = "https://login.tidal.com/authorize"
+TIDAL_TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
+TIDAL_OPENAPI_BASE_URL = "https://openapi.tidal.com/v2"
+TIDAL_AUDIT_SCOPES = ("collection.read",)
+TIDAL_CATALOG_BATCH_SIZE = 50
+_JSON_API_MEDIA_TYPE = "application/vnd.api+json"
+_DURATION_PATTERN = re.compile(
+    r"^P(?:(?P<days>\d+(?:\.\d+)?)D)?(?:T(?:(?P<hours>\d+(?:\.\d+)?)H)?"
+    r"(?:(?P<minutes>\d+(?:\.\d+)?)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?)?$"
+)
 
-    oauth_scope = "r_usr"
 
-    def get_link_login(self) -> LinkLogin:
-        response = self.request_session.post(
-            "https://auth.tidal.com/v1/oauth2/device_authorization",
-            {
-                "client_id": self.config.client_id,
-                "scope": self.oauth_scope,
-            },
+class TidalOAuthError(RuntimeError):
+    """A Tidal OAuth request failed without exposing its sensitive response."""
+
+
+class TidalAPIError(RuntimeError):
+    """A read-only Tidal OpenAPI request failed."""
+
+
+@dataclass(frozen=True)
+class TidalCredentials:
+    access_token: str
+    refresh_token: str | None
+    token_type: str
+    expires_at: datetime.datetime | None
+    scope: str
+
+
+@dataclass(frozen=True)
+class TidalArtist:
+    name: str
+
+
+@dataclass(frozen=True)
+class TidalAuditTrack:
+    """Small adapter matching the fields used by the existing audit matcher."""
+
+    id: str
+    isrc: str
+    name: str
+    duration: float
+    artists: tuple[TidalArtist, ...]
+    version: str | None
+    date_added: datetime.datetime | None
+    user_date_added: datetime.datetime | None
+
+
+def generate_pkce_verifier() -> str:
+    """Generate an RFC 7636 verifier in the allowed 43-128 character range."""
+    return secrets.token_urlsafe(64)
+
+
+def pkce_s256(verifier: str) -> str:
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+
+
+def build_authorization_url(
+    client_id: str,
+    redirect_uri: str,
+    state: str,
+    code_verifier: str,
+) -> str:
+    query = urlencode({
+        "client_id": client_id,
+        "code_challenge": pkce_s256(code_verifier),
+        "code_challenge_method": "S256",
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": " ".join(TIDAL_AUDIT_SCOPES),
+        "state": state,
+    })
+    return f"{TIDAL_AUTHORIZE_URL}?{query}"
+
+
+def _credentials_from_payload(payload: Any) -> TidalCredentials:
+    if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str):
+        raise TidalOAuthError("Tidal returned an invalid token response")
+    returned_scope = payload.get("scope")
+    if isinstance(returned_scope, str) and set(returned_scope.split()) != set(TIDAL_AUDIT_SCOPES):
+        raise TidalOAuthError("Tidal returned unexpected authorization scopes")
+    expires_at = None
+    expires_in = payload.get("expires_in")
+    if isinstance(expires_in, (int, float)) and expires_in > 0:
+        expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            seconds=float(expires_in)
         )
-        if not response.ok:
-            raise RuntimeError("Tidal device authorization was rejected")
-        try:
-            return LinkLogin(response.json())
-        except (KeyError, TypeError, ValueError) as exc:
-            raise RuntimeError("Tidal returned an invalid device authorization response") from exc
+    return TidalCredentials(
+        access_token=payload["access_token"],
+        refresh_token=(
+            payload.get("refresh_token")
+            if isinstance(payload.get("refresh_token"), str)
+            else None
+        ),
+        token_type=(payload.get("token_type") or "Bearer"),
+        expires_at=expires_at,
+        scope=(returned_scope or " ".join(TIDAL_AUDIT_SCOPES)),
+    )
 
-    def _check_link_login(self, link_login: LinkLogin, until_expiry: bool = True):
-        remaining = link_login.expires_in if until_expiry else 1
-        interval = max(1.0, link_login.interval)
-        while remaining > 0:
-            response = self.request_session.post(
-                self.config.api_oauth2_token,
-                {
-                    "client_id": self.config.client_id,
-                    "client_secret": self.config.client_secret,
-                    "device_code": link_login.device_code,
-                    "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    "scope": self.oauth_scope,
+
+async def exchange_authorization_code(
+    *,
+    client_id: str,
+    client_secret: str,
+    code: str,
+    code_verifier: str,
+    redirect_uri: str,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> TidalCredentials:
+    """Exchange one authorization code; response details are never put in errors."""
+    try:
+        async with httpx.AsyncClient(timeout=15, transport=transport) as client:
+            response = await client.post(
+                TIDAL_TOKEN_URL,
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "code_verifier": code_verifier,
+                    "grant_type": "authorization_code",
+                    "redirect_uri": redirect_uri,
+                    "scope": " ".join(TIDAL_AUDIT_SCOPES),
                 },
+                headers={"Accept": "application/json"},
             )
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise RuntimeError("Tidal returned an invalid token response") from exc
-
-            if response.ok:
-                return payload
-
-            error = payload.get("error") if isinstance(payload, dict) else None
-            if error == "expired_token":
-                break
-            if error not in {"authorization_pending", "slow_down"}:
-                raise RuntimeError("Tidal device authorization failed")
-            if error == "slow_down":
-                interval += 1
-            time.sleep(interval)
-            remaining -= interval
-
-        raise TimeoutError("Tidal device authorization expired")
+            response.raise_for_status()
+            return _credentials_from_payload(response.json())
+    except (httpx.HTTPError, ValueError) as exc:
+        raise TidalOAuthError("Tidal rejected the authorization code exchange") from exc
 
 
-def new_read_only_tidal_session(client_id: str, client_secret: str) -> ReadOnlyTidalSession:
-    """Create a Tidal session with operator-owned credentials and no disk cache."""
-    session = ReadOnlyTidalSession()
-    session.config.client_id = client_id
-    session.config.client_secret = client_secret
-    return session
+def _parse_datetime(value: Any) -> datetime.datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _duration_seconds(value: Any) -> float:
+    if not isinstance(value, str):
+        return 0.0
+    match = _DURATION_PATTERN.fullmatch(value)
+    if match is None:
+        return 0.0
+    parts = {key: float(number or 0) for key, number in match.groupdict().items()}
+    return (
+        parts["days"] * 86400
+        + parts["hours"] * 3600
+        + parts["minutes"] * 60
+        + parts["seconds"]
+    )
+
+
+def _batches(values: list[str], size: int) -> Iterable[list[str]]:
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _safe_next_url(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TidalAPIError("Tidal returned an invalid pagination link")
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "openapi.tidal.com"
+        or not parsed.path.startswith("/v2/")
+        or parsed.username
+        or parsed.password
+    ):
+        raise TidalAPIError("Tidal returned an unsafe pagination link")
+    return value
+
+
+class TidalOpenAPIClient:
+    """Read only My Collection client; it intentionally exposes no write methods."""
+
+    def __init__(
+        self,
+        credentials: TidalCredentials,
+        client_id: str,
+        client_secret: str,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._credentials = credentials
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._transport = transport
+        self._catalog_token: str | None = None
+
+    async def _catalog_access_token(self, client: httpx.AsyncClient) -> str:
+        if self._catalog_token:
+            return self._catalog_token
+        try:
+            response = await client.post(
+                TIDAL_TOKEN_URL,
+                data={
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "grant_type": "client_credentials",
+                },
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            raise TidalAPIError("Tidal catalog authorization failed") from exc
+        if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str):
+            raise TidalAPIError("Tidal returned an invalid catalog token response")
+        self._catalog_token = payload["access_token"]
+        return self._catalog_token
+
+    async def favorite_tracks(self) -> list[TidalAuditTrack]:
+        """Load favorites and their historical addedAt using official OpenAPI GETs."""
+        collection: list[tuple[str, datetime.datetime | None]] = []
+        user_headers = {
+            "Authorization": f"Bearer {self._credentials.access_token}",
+            "Accept": _JSON_API_MEDIA_TYPE,
+        }
+        url: str | None = (
+            f"{TIDAL_OPENAPI_BASE_URL}/userCollectionTracks/me/relationships/items"
+        )
+        params: dict[str, str] | None = {"sort": "addedAt"}
+
+        try:
+            async with httpx.AsyncClient(timeout=20, transport=self._transport) as client:
+                while url:
+                    response = await client.get(url, params=params, headers=user_headers)
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                        raise TidalAPIError("Tidal returned an invalid collection response")
+                    for item in payload["data"]:
+                        if not isinstance(item, dict) or not item.get("id"):
+                            raise TidalAPIError("Tidal returned an invalid collection item")
+                        collection.append((
+                            str(item["id"]),
+                            _parse_datetime((item.get("meta") or {}).get("addedAt")),
+                        ))
+                    url = _safe_next_url((payload.get("links") or {}).get("next"))
+                    params = None
+
+                if not collection:
+                    return []
+
+                catalog_token = await self._catalog_access_token(client)
+                catalog_headers = {
+                    "Authorization": f"Bearer {catalog_token}",
+                    "Accept": _JSON_API_MEDIA_TYPE,
+                }
+                resources: dict[str, dict] = {}
+                artists: dict[str, str] = {}
+                for batch in _batches([track_id for track_id, _ in collection], TIDAL_CATALOG_BATCH_SIZE):
+                    query: list[tuple[str, str]] = [("filter[id]", item) for item in batch]
+                    query.append(("include", "artists"))
+                    response = await client.get(
+                        f"{TIDAL_OPENAPI_BASE_URL}/tracks",
+                        params=query,
+                        headers=catalog_headers,
+                    )
+                    response.raise_for_status()
+                    payload = response.json()
+                    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+                        raise TidalAPIError("Tidal returned an invalid catalog response")
+                    for resource in payload["data"]:
+                        if isinstance(resource, dict) and resource.get("id"):
+                            resources[str(resource["id"])] = resource
+                    for included in payload.get("included") or []:
+                        if (
+                            isinstance(included, dict)
+                            and included.get("type") == "artists"
+                            and included.get("id")
+                        ):
+                            name = (included.get("attributes") or {}).get("name")
+                            if isinstance(name, str):
+                                artists[str(included["id"])] = name
+        except TidalAPIError:
+            raise
+        except (httpx.HTTPError, ValueError) as exc:
+            raise TidalAPIError("Tidal read-only collection request failed") from exc
+
+        tracks: list[TidalAuditTrack] = []
+        for track_id, added_at in collection:
+            resource = resources.get(track_id)
+            if resource is None:
+                raise TidalAPIError("Tidal catalog metadata was incomplete")
+            attributes = resource.get("attributes") or {}
+            artist_ids = (
+                ((resource.get("relationships") or {}).get("artists") or {}).get("data")
+                or []
+            )
+            track_artists = tuple(
+                TidalArtist(artists[str(identifier["id"])])
+                for identifier in artist_ids
+                if isinstance(identifier, dict) and str(identifier.get("id")) in artists
+            )
+            tracks.append(TidalAuditTrack(
+                id=track_id,
+                isrc=str(attributes.get("isrc") or ""),
+                name=str(attributes.get("title") or ""),
+                duration=_duration_seconds(attributes.get("duration")),
+                artists=track_artists,
+                version=(str(attributes["version"]) if attributes.get("version") else None),
+                date_added=added_at,
+                user_date_added=added_at,
+            ))
+        return tracks

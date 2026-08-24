@@ -223,7 +223,15 @@ async def _catalog_matches_for_unmatched(
     tidal_tracks: Sequence,
     config: dict,
 ) -> dict[str, dict | None]:
-    if not tidal_tracks:
+    searchable_tracks = [
+        track for track in tidal_tracks
+        if getattr(track, "isrc", None)
+        or (
+            getattr(track, "name", None)
+            and any(getattr(artist, "name", None) for artist in getattr(track, "artists", []))
+        )
+    ]
+    if not searchable_tracks:
         return {}
 
     max_concurrency = config.get("max_concurrency", 10)
@@ -247,7 +255,7 @@ async def _catalog_matches_for_unmatched(
                 spotify_session,
                 record_failure=False,
             )
-            for track in tidal_tracks
+            for track in searchable_tracks
         ])
     finally:
         limiter_task.cancel()
@@ -256,7 +264,7 @@ async def _catalog_matches_for_unmatched(
 
     return {
         str(track.id): result
-        for track, result in zip(tidal_tracks, results)
+        for track, result in zip(searchable_tracks, results)
     }
 
 
@@ -299,6 +307,19 @@ async def collect_favorites_audit_rows(
         order="DATE",
         order_direction="ASC",
     )
+    return await collect_favorites_audit_rows_from_tracks(
+        spotify_session,
+        tidal_tracks,
+        config,
+    )
+
+
+async def collect_favorites_audit_rows_from_tracks(
+    spotify_session: spotipy.Spotify,
+    tidal_tracks: Sequence,
+    config: dict,
+) -> list[dict]:
+    """Audit a supplied read-only Tidal collection against Spotify Liked Songs."""
     print("Loading Liked Songs from Spotify (read-only audit)")
     spotify_items = await repeat_on_request_error(
         get_spotify_saved_track_items,

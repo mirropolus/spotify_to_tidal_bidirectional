@@ -1,6 +1,6 @@
 import csv
+import datetime
 import io
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -13,7 +13,7 @@ from spotify_to_tidal.webapp.app import (
     WebSettings,
     create_app,
 )
-from spotify_to_tidal.webapp.tidal_auth import ReadOnlyTidalSession
+from spotify_to_tidal.webapp.tidal_auth import TidalCredentials
 
 
 def configured_settings(**overrides):
@@ -37,7 +37,7 @@ def connected_client():
     _, state, created = store.get_or_create(session_id)
     assert not created
     state.spotify_session = MagicMock()
-    state.tidal_session = MagicMock()
+    state.tidal_client = MagicMock()
     return client, store, state
 
 
@@ -107,56 +107,161 @@ def test_spotify_callback_rejects_invalid_state_without_token_exchange(mocker):
     exchange.assert_not_called()
 
 
-def test_tidal_device_authorization_requests_read_only_scope():
-    response = MagicMock(ok=True)
-    response.json.return_value = {
-        "expiresIn": 300,
-        "userCode": "ABCD",
-        "verificationUri": "link.tidal.com",
-        "verificationUriComplete": "link.tidal.com/ABCD",
-        "interval": 2,
-        "deviceCode": "device-code",
-    }
-    session = object.__new__(ReadOnlyTidalSession)
-    session.request_session = MagicMock()
-    session.request_session.post.return_value = response
-    session.config = SimpleNamespace(client_id="client-id")
-
-    link = session.get_link_login()
-
-    assert link.user_code == "ABCD"
-    _, payload = session.request_session.post.call_args.args
-    assert payload["scope"] == "r_usr"
-    assert "w_usr" not in payload["scope"]
-
-
-def test_tidal_token_poll_requests_read_only_scope(mocker):
-    pending = MagicMock(ok=False)
-    pending.json.return_value = {"error": "authorization_pending"}
-    complete = MagicMock(ok=True)
-    complete.json.return_value = {
-        "access_token": "not-rendered",
-        "refresh_token": "not-rendered",
-        "expires_in": 3600,
-        "token_type": "Bearer",
-    }
-    session = object.__new__(ReadOnlyTidalSession)
-    session.request_session = MagicMock()
-    session.request_session.post.side_effect = [pending, complete]
-    session.config = SimpleNamespace(
-        client_id="client-id",
-        client_secret="client-secret",
-        api_oauth2_token="https://auth.tidal.com/v1/oauth2/token",
+def test_tidal_start_requires_csrf_and_redirects_to_authorization_code_pkce():
+    store = MemorySessionStore(7200)
+    client = TestClient(
+        create_app(configured_settings(), store=store),
+        base_url="https://audit.example.test",
     )
-    link = SimpleNamespace(expires_in=10, interval=1, device_code="device-code")
-    mocker.patch("spotify_to_tidal.webapp.tidal_auth.time.sleep")
+    client.get("/")
+    session_id = client.cookies.get(COOKIE_NAME)
+    _, state, _ = store.get_or_create(session_id)
 
-    result = session._check_link_login(link)
+    rejected = client.post(
+        "/auth/tidal/start",
+        data={"csrf_token": "wrong"},
+        follow_redirects=False,
+    )
+    response = client.post(
+        "/auth/tidal/start",
+        data={"csrf_token": state.csrf_token},
+        follow_redirects=False,
+    )
 
-    assert result["access_token"] == "not-rendered"
-    for call in session.request_session.post.call_args_list:
-        assert call.args[1]["scope"] == "r_usr"
-        assert "w_usr" not in call.args[1]["scope"]
+    assert rejected.status_code == 403
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("https://login.tidal.com/authorize?")
+    assert state.tidal_state
+    assert state.tidal_code_verifier
+    assert state.tidal_client is None
+
+
+def test_tidal_callback_rejects_invalid_state_without_exchange(mocker):
+    store = MemorySessionStore(7200)
+    client = TestClient(
+        create_app(configured_settings(), store=store),
+        base_url="https://audit.example.test",
+    )
+    client.get("/")
+    session_id = client.cookies.get(COOKIE_NAME)
+    _, browser, _ = store.get_or_create(session_id)
+    client.post(
+        "/auth/tidal/start",
+        data={"csrf_token": browser.csrf_token},
+        follow_redirects=False,
+    )
+    exchange = mocker.patch(
+        "spotify_to_tidal.webapp.app.exchange_authorization_code",
+        new=mocker.AsyncMock(),
+    )
+
+    response = client.get(
+        "/auth/tidal/callback?code=one-time-code&state=wrong",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    exchange.assert_not_awaited()
+    assert browser.tidal_client is None
+    assert browser.tidal_state is not None
+    assert browser.tidal_code_verifier is not None
+
+
+def test_unsolicited_tidal_callback_does_not_disconnect_existing_session(mocker):
+    client, _, browser = connected_client()
+    existing_client = browser.tidal_client
+    exchange = mocker.patch(
+        "spotify_to_tidal.webapp.app.exchange_authorization_code",
+        new=mocker.AsyncMock(),
+    )
+
+    response = client.get(
+        "/auth/tidal/callback?error=access_denied&state=untrusted",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    exchange.assert_not_awaited()
+    assert browser.tidal_client is existing_client
+
+
+def test_tidal_callback_exchanges_code_and_keeps_token_only_in_memory(mocker):
+    store = MemorySessionStore(7200)
+    client = TestClient(
+        create_app(configured_settings(), store=store),
+        base_url="https://audit.example.test",
+    )
+    client.get("/")
+    session_id = client.cookies.get(COOKIE_NAME)
+    _, browser, _ = store.get_or_create(session_id)
+    client.post(
+        "/auth/tidal/start",
+        data={"csrf_token": browser.csrf_token},
+        follow_redirects=False,
+    )
+    expected_state = browser.tidal_state
+    expected_verifier = browser.tidal_code_verifier
+    credentials = TidalCredentials(
+        access_token="private-access-token",
+        refresh_token="private-refresh-token",
+        token_type="Bearer",
+        expires_at=datetime.datetime.now(datetime.timezone.utc),
+        scope="collection.read",
+    )
+    exchange = mocker.patch(
+        "spotify_to_tidal.webapp.app.exchange_authorization_code",
+        new=mocker.AsyncMock(return_value=credentials),
+    )
+
+    response = client.get(
+        f"/auth/tidal/callback?code=one-time-code&state={expected_state}",
+        follow_redirects=False,
+    )
+    home = client.get("/")
+
+    assert response.status_code == 303
+    exchange.assert_awaited_once_with(
+        client_id="tidal-client-id",
+        client_secret="tidal-client-secret",
+        code="one-time-code",
+        code_verifier=expected_verifier,
+        redirect_uri="https://audit.example.test/auth/tidal/callback",
+    )
+    assert browser.tidal_client is not None
+    assert browser.tidal_state is None
+    assert browser.tidal_code_verifier is None
+    assert "private-access-token" not in response.headers.get("set-cookie", "")
+    assert "private-access-token" not in home.text
+    assert "private-refresh-token" not in home.text
+
+
+def test_tidal_callback_handles_provider_error_without_exchange(mocker):
+    store = MemorySessionStore(7200)
+    client = TestClient(
+        create_app(configured_settings(), store=store),
+        base_url="https://audit.example.test",
+    )
+    client.get("/")
+    session_id = client.cookies.get(COOKIE_NAME)
+    _, browser, _ = store.get_or_create(session_id)
+    client.post(
+        "/auth/tidal/start",
+        data={"csrf_token": browser.csrf_token},
+        follow_redirects=False,
+    )
+    exchange = mocker.patch(
+        "spotify_to_tidal.webapp.app.exchange_authorization_code",
+        new=mocker.AsyncMock(),
+    )
+
+    response = client.get(
+        f"/auth/tidal/callback?error=access_denied&state={browser.tidal_state}",
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    exchange.assert_not_awaited()
+    assert browser.tidal_client is None
 
 
 def test_web_audit_is_read_only_and_downloads_csv(mocker):
@@ -175,9 +280,11 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
         "timestamp_suspect_reason": "spotify_added_much_later_than_tidal;clustered_spotify_added_at",
     }]
     collect = mocker.patch(
-        "spotify_to_tidal.webapp.app.collect_favorites_audit_rows",
+        "spotify_to_tidal.webapp.app.collect_favorites_audit_rows_from_tracks",
         new=mocker.AsyncMock(return_value=rows),
     )
+    tidal_tracks = [MagicMock()]
+    state.tidal_client.favorite_tracks = mocker.AsyncMock(return_value=tidal_tracks)
 
     response = client.post(
         "/audit",
@@ -188,19 +295,16 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
     assert response.status_code == 303
     collect.assert_awaited_once_with(
         state.spotify_session,
-        state.tidal_session,
+        tidal_tracks,
         {
             "audit_timestamp_mismatch_days": 30,
             "audit_timestamp_cluster_size": 3,
         },
     )
-    for session in (state.spotify_session, state.tidal_session):
-        session.current_user_saved_tracks_add.assert_not_called()
-        session.current_user_saved_tracks_delete.assert_not_called()
-        session.playlist_add_items.assert_not_called()
-        session.playlist_replace_items.assert_not_called()
-        session.user.favorites.add_track.assert_not_called()
-        session.user.favorites.remove_track.assert_not_called()
+    state.spotify_session.current_user_saved_tracks_add.assert_not_called()
+    state.spotify_session.current_user_saved_tracks_delete.assert_not_called()
+    state.spotify_session.playlist_add_items.assert_not_called()
+    state.spotify_session.playlist_replace_items.assert_not_called()
 
     download = client.get("/favorites_audit.csv")
     assert download.status_code == 200
@@ -220,6 +324,8 @@ def test_web_app_exposes_no_sync_or_delete_library_routes():
     route_paths = {route.path for route in app.routes}
     assert not any("sync" in path for path in route_paths)
     assert not any("playlist" in path for path in route_paths)
+    assert "/auth/tidal/status" not in route_paths
+    assert "/auth/tidal/callback" in route_paths
     assert route_paths >= {"/audit", "/favorites_audit.csv", "/session/delete"}
 
 
@@ -238,5 +344,23 @@ def test_delete_session_removes_in_memory_tokens_and_report():
     _, new_state, created = store.get_or_create(session_id)
     assert created
     assert new_state.spotify_session is None
-    assert new_state.tidal_session is None
+    assert new_state.tidal_client is None
     assert new_state.audit_csv is None
+
+
+def test_expired_session_drops_in_memory_provider_credentials(mocker):
+    store = MemorySessionStore(300)
+    session_id, state, _ = store.get_or_create(None)
+    state.spotify_session = MagicMock()
+    state.tidal_client = MagicMock()
+    mocker.patch(
+        "spotify_to_tidal.webapp.app.time.monotonic",
+        return_value=state.created_monotonic + 301,
+    )
+
+    new_id, new_state, created = store.get_or_create(session_id)
+
+    assert created
+    assert new_id != session_id
+    assert new_state.spotify_session is None
+    assert new_state.tidal_client is None

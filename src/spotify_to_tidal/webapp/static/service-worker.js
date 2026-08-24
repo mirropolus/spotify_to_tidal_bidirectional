@@ -1,4 +1,4 @@
-const CACHE_NAME = "favorite-bridge-shell-v1";
+const CACHE_NAME = "favorite-bridge-shell-v2";
 const STATIC_ASSETS = [
   "/static/app.css",
   "/static/app.js",
