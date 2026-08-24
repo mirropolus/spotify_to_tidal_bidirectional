@@ -33,3 +33,4 @@ rate_limit:      10 # max sustained connections per second
 # audit thresholds (the audit never changes either account)
 audit_timestamp_mismatch_days: 30
 audit_timestamp_cluster_size: 3
+audit_timestamp_cluster_min_delta_hours: 24

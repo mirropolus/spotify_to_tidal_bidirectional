@@ -157,8 +157,10 @@ callback codes do not appear in its logs.
 
 ## 5. Report contents
 
-The CSV contains service IDs, ISRC, artist/title, both `added_at` values,
-timestamp delta, cluster information, and one of these statuses:
+The CSV contains actual saved-library IDs, a separate
+`spotify_catalog_candidate_id`, ISRC, artist/title, both `added_at` values,
+timestamp delta, minute-level cluster information, source occurrence/conflict
+fields, and one of these statuses:
 
 - `matched`
 - `timestamp_mismatch`
@@ -168,6 +170,25 @@ timestamp delta, cluster information, and one of these statuses:
 
 The report never repairs a suspicious timestamp. Repair would require account
 writes and remains outside this application.
+
+Before matching, repeated provider collection resources with the same track ID
+are collapsed to one entry and the earliest available historical timestamp is
+retained. `tidal_source_occurrences` and `spotify_source_occurrences` record how
+many source entries were seen. The corresponding `*_duplicate_conflict`
+columns report inconsistent timestamps or metadata, and the web summary warns
+when duplicates or conflicts were found.
+
+`spotify_id` means the track is actually present in Liked Songs. A catalog
+search hit for a Tidal-only favorite appears only in
+`spotify_catalog_candidate_id`; it must not be counted as an existing like.
+
+The default timestamp heuristic flags Spotify dates more than 30 days after
+Tidal. It also examines all Spotify likes at UTC-minute precision: a paired
+track more than 24 hours later than Tidal is flagged when at least three likes
+share that Spotify minute. This catches bulk-import bursts without treating a
+same-day pair as damaged. Configure the web version with
+`AUDIT_TIMESTAMP_MISMATCH_DAYS`, `AUDIT_TIMESTAMP_CLUSTER_SIZE`, and
+`AUDIT_TIMESTAMP_CLUSTER_MIN_DELTA_HOURS` if different thresholds are needed.
 
 ## Security and operational limitations
 

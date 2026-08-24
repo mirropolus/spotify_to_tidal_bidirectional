@@ -29,6 +29,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from ..audit import (
     AUDIT_FIELDS,
     AuditStageError,
+    audit_integrity_warnings,
     collect_favorites_audit_rows_from_tracks,
 )
 from .tidal_auth import (
@@ -69,6 +70,7 @@ class WebSettings:
     session_ttl_seconds: int = DEFAULT_SESSION_TTL_SECONDS
     mismatch_days: int = 30
     cluster_size: int = 3
+    cluster_min_delta_hours: int = 24
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "base_url", _validated_base_url(self.base_url))
@@ -87,6 +89,9 @@ class WebSettings:
             ),
             mismatch_days=int(os.getenv("AUDIT_TIMESTAMP_MISMATCH_DAYS", "30")),
             cluster_size=int(os.getenv("AUDIT_TIMESTAMP_CLUSTER_SIZE", "3")),
+            cluster_min_delta_hours=int(
+                os.getenv("AUDIT_TIMESTAMP_CLUSTER_MIN_DELTA_HOURS", "24")
+            ),
         )
 
 
@@ -103,6 +108,7 @@ class BrowserSession:
     audit_csv: bytes | None = None
     audit_counts: dict[str, int] = field(default_factory=dict)
     audit_preview: list[dict] = field(default_factory=list)
+    audit_warnings: list[str] = field(default_factory=list)
     audit_generated_at: str | None = None
     notice: str | None = None
     error: str | None = None
@@ -111,6 +117,7 @@ class BrowserSession:
         self.audit_csv = None
         self.audit_counts = {}
         self.audit_preview = []
+        self.audit_warnings = []
         self.audit_generated_at = None
 
 
@@ -231,6 +238,7 @@ def create_app(
                 "can_audit": state.spotify_session is not None and tidal_status == "connected",
                 "audit_counts": state.audit_counts,
                 "audit_preview": state.audit_preview,
+                "audit_warnings": state.audit_warnings,
                 "audit_generated_at": state.audit_generated_at,
                 "notice": notice,
                 "error": error,
@@ -408,6 +416,9 @@ def create_app(
                 {
                     "audit_timestamp_mismatch_days": settings.mismatch_days,
                     "audit_timestamp_cluster_size": settings.cluster_size,
+                    "audit_timestamp_cluster_min_delta_hours": (
+                        settings.cluster_min_delta_hours
+                    ),
                 },
             )
             state.audit_csv = _csv_bytes(rows)
@@ -416,6 +427,7 @@ def create_app(
                 row for row in rows
                 if row["status"] in {"timestamp_mismatch", "match_failed"}
             ][:20]
+            state.audit_warnings = audit_integrity_warnings(rows)
             state.audit_generated_at = datetime.datetime.now(
                 datetime.timezone.utc
             ).replace(microsecond=0).isoformat().replace("+00:00", "Z")

@@ -161,9 +161,18 @@ python3.11 -m spotify_to_tidal \
   --audit-output reports/favorites_audit.csv
 ```
 
-The CSV contains Tidal and Spotify IDs, ISRC, artist, title, both service
-timestamps, signed timestamp delta, status, same-day cluster size, and a
-suspicion reason. Statuses are:
+The CSV contains actual saved-library IDs, a separate Spotify catalog-candidate
+ID, ISRC, artist, title, both service timestamps, signed timestamp delta,
+minute-level Spotify cluster size, source occurrence/conflict fields, and a
+suspicion reason. `spotify_id` is populated only when the item is actually in
+Liked Songs; `spotify_catalog_candidate_id` is only a search result for a
+Tidal-only favorite.
+
+Repeated collection resources with the same provider track ID are collapsed
+before matching, so the report contains no duplicate saved-library IDs. The
+earliest historical timestamp is retained. The source occurrence and conflict
+columns make that normalization explicit, and the web app also shows an
+integrity warning when it occurs. Statuses are:
 
 | Status | Meaning |
 |---|---|
@@ -174,12 +183,15 @@ suspicion reason. Statuses are:
 | `match_failed` | Saved in Tidal but no safe Spotify catalog match was found |
 
 By default, a timestamp is suspicious when Spotify is more than 30 days later
-than Tidal. Three or more suspicious additions on the same Spotify calendar day
-are also marked as a cluster. These heuristics can be adjusted in `config.yml`:
+than Tidal. The audit also detects bursts across all Spotify likes: when at
+least three likes share the same UTC minute, a paired item added more than 24
+hours after its Tidal timestamp is flagged even if it falls short of 30 days.
+Same-day pairs remain matched. These heuristics can be adjusted in `config.yml`:
 
 ```yaml
 audit_timestamp_mismatch_days: 30
 audit_timestamp_cluster_size: 3
+audit_timestamp_cluster_min_delta_hours: 24
 ```
 
 The report is diagnostic only. It does not remove/re-add likes or repair dates.

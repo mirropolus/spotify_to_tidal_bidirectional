@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from spotify_to_tidal import __main__
 from spotify_to_tidal.audit import (
+    audit_integrity_warnings,
     audit_favorites,
     build_favorites_audit_rows,
     collect_favorites_audit_rows_from_tracks,
@@ -69,6 +70,8 @@ def test_audit_output_contains_all_statuses():
     assert by_tidal_id["tidal-mismatch"]["status"] == "timestamp_mismatch"
     assert by_tidal_id["tidal-mismatch"]["timestamp_delta_seconds"] > 0
     assert by_tidal_id["tidal-only"]["status"] == "tidal_only"
+    assert by_tidal_id["tidal-only"]["spotify_id"] == ""
+    assert by_tidal_id["tidal-only"]["spotify_catalog_candidate_id"] == "spotify-catalog"
     assert by_tidal_id["tidal-failed"]["status"] == "match_failed"
     assert by_spotify_id["spotify-only"]["status"] == "spotify_only"
 
@@ -88,6 +91,120 @@ def test_audit_flags_clustered_suspicious_timestamps():
     assert {row["status"] for row in rows} == {"timestamp_mismatch"}
     assert {row["spotify_added_cluster_size"] for row in rows} == {3}
     assert all("clustered_spotify_added_at" in row["timestamp_suspect_reason"] for row in rows)
+
+
+def test_audit_deduplicates_tidal_ids_and_preserves_earliest_timestamp():
+    later = tidal_track(
+        "tidal-duplicate",
+        "ISRCDUPLICATE",
+        datetime.datetime(2025, 1, 30, tzinfo=UTC),
+    )
+    earlier = tidal_track(
+        "tidal-duplicate",
+        "ISRCDUPLICATE",
+        datetime.datetime(2021, 5, 12, 14, 32, 10, tzinfo=UTC),
+    )
+    spotify = [
+        saved_item(
+            "spotify-duplicate",
+            "ISRCDUPLICATE",
+            "2026-05-26T08:28:12Z",
+        )
+    ]
+
+    rows = build_favorites_audit_rows([later, earlier], spotify)
+
+    assert len(rows) == 1
+    assert rows[0]["tidal_date_added"] == "2021-05-12T14:32:10.000Z"
+    assert rows[0]["tidal_source_occurrences"] == 2
+    assert rows[0]["tidal_source_duplicate_conflict"] == "date_added_conflict"
+    assert audit_integrity_warnings(rows) == [
+        "Collapsed 1 duplicate Tidal collection records across 1 IDs; "
+        "the earliest timestamp was retained.",
+        "1 duplicated Tidal IDs had conflicting source data; inspect the CSV "
+        "conflict column before planning changes.",
+    ]
+
+
+def test_audit_reports_duplicate_metadata_conflict():
+    first = tidal_track(
+        "tidal-duplicate",
+        "ISRCONE",
+        datetime.datetime(2024, 1, 1, tzinfo=UTC),
+    )
+    second = tidal_track(
+        "tidal-duplicate",
+        "ISRCTWO",
+        datetime.datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+    rows = build_favorites_audit_rows([first, second], [])
+
+    assert len(rows) == 1
+    assert rows[0]["tidal_source_duplicate_conflict"] == "metadata_conflict"
+
+
+def test_cluster_uses_all_spotify_likes_and_flags_shorter_delta():
+    tidal = [
+        tidal_track(
+            "tidal-paired",
+            "ISRCPAIRED",
+            datetime.datetime(2026, 4, 28, 8, 28, tzinfo=UTC),
+        )
+    ]
+    spotify = [
+        saved_item("spotify-paired", "ISRCPAIRED", "2026-05-26T08:28:10Z"),
+        saved_item("spotify-only-1", "ISRCOTHER1", "2026-05-26T08:28:11Z"),
+        saved_item("spotify-only-2", "ISRCOTHER2", "2026-05-26T08:28:12Z"),
+    ]
+
+    rows = build_favorites_audit_rows(tidal, spotify)
+    paired = next(row for row in rows if row["tidal_id"] == "tidal-paired")
+
+    assert paired["status"] == "timestamp_mismatch"
+    assert paired["spotify_added_cluster_size"] == 3
+    assert paired["timestamp_suspect_reason"] == (
+        "spotify_added_later_than_tidal_in_cluster;clustered_spotify_added_at"
+    )
+    assert {
+        row["spotify_added_cluster_size"] for row in rows if row["spotify_id"]
+    } == {3}
+
+
+def test_same_day_timestamp_in_large_cluster_remains_matched():
+    tidal = [
+        tidal_track(
+            "tidal-paired",
+            "ISRCPAIRED",
+            datetime.datetime(2026, 5, 26, 7, 30, tzinfo=UTC),
+        )
+    ]
+    spotify = [
+        saved_item("spotify-paired", "ISRCPAIRED", "2026-05-26T08:28:10Z"),
+        saved_item("spotify-only-1", "ISRCOTHER1", "2026-05-26T08:28:11Z"),
+        saved_item("spotify-only-2", "ISRCOTHER2", "2026-05-26T08:28:12Z"),
+    ]
+
+    rows = build_favorites_audit_rows(tidal, spotify)
+    paired = next(row for row in rows if row["tidal_id"] == "tidal-paired")
+
+    assert paired["status"] == "matched"
+    assert paired["spotify_added_cluster_size"] == 3
+    assert paired["timestamp_suspect_reason"] == ""
+
+
+def test_audit_deduplicates_spotify_saved_ids_and_keeps_earliest_added_at():
+    spotify = [
+        saved_item("spotify-duplicate", "ISRCDUPLICATE", "2026-05-26T08:28:12Z"),
+        saved_item("spotify-duplicate", "ISRCDUPLICATE", "2024-01-01T00:00:00Z"),
+    ]
+
+    rows = build_favorites_audit_rows([], spotify)
+
+    assert len(rows) == 1
+    assert rows[0]["spotify_added_at"] == "2024-01-01T00:00:00.000Z"
+    assert rows[0]["spotify_source_occurrences"] == 2
+    assert rows[0]["spotify_source_duplicate_conflict"] == "added_at_conflict"
 
 
 def test_audit_is_account_read_only_and_writes_csv(mocker, tmp_path):

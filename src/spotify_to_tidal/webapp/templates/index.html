@@ -116,6 +116,15 @@
           <div><strong>{{ audit_counts.get('match_failed', 0) }}</strong><span>Failed matches</span></div>
         </div>
 
+        {% if audit_warnings %}
+        <div class="integrity-warnings" role="status">
+          <h3>Source integrity notes</h3>
+          <ul>
+            {% for warning in audit_warnings %}<li>{{ warning }}</li>{% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+
         {% if audit_preview %}
         <div class="preview-list">
           <h3>Items requiring attention</h3>

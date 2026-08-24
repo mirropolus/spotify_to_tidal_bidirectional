@@ -270,6 +270,7 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
     rows = [{
         "tidal_id": "tidal-1",
         "spotify_id": "spotify-1",
+        "spotify_catalog_candidate_id": "",
         "isrc": "ISRC1",
         "artist": "Artist",
         "title": "Old favorite",
@@ -279,6 +280,10 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
         "timestamp_delta_seconds": "156000000",
         "spotify_added_cluster_size": "8",
         "timestamp_suspect_reason": "spotify_added_much_later_than_tidal;clustered_spotify_added_at",
+        "tidal_source_occurrences": "2",
+        "tidal_source_duplicate_conflict": "date_added_conflict",
+        "spotify_source_occurrences": "1",
+        "spotify_source_duplicate_conflict": "",
     }]
     collect = mocker.patch(
         "spotify_to_tidal.webapp.app.collect_favorites_audit_rows_from_tracks",
@@ -300,6 +305,7 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
         {
             "audit_timestamp_mismatch_days": 30,
             "audit_timestamp_cluster_size": 3,
+            "audit_timestamp_cluster_min_delta_hours": 24,
         },
     )
     state.spotify_session.current_user_saved_tracks_add.assert_not_called()
@@ -312,6 +318,9 @@ def test_web_audit_is_read_only_and_downloads_csv(mocker):
     assert "favorites_audit.csv" in download.headers["content-disposition"]
     parsed = list(csv.DictReader(io.StringIO(download.content.decode("utf-8-sig"))))
     assert parsed == rows
+    home = client.get("/")
+    assert "Collapsed 1 duplicate Tidal collection records across 1 IDs" in home.text
+    assert "conflicting source data" in home.text
 
 
 def test_web_audit_requires_csrf():

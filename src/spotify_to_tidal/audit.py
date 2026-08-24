@@ -26,6 +26,7 @@ from .tidalapi_patch import get_all_favorites
 AUDIT_FIELDS = [
     "tidal_id",
     "spotify_id",
+    "spotify_catalog_candidate_id",
     "isrc",
     "artist",
     "title",
@@ -35,6 +36,10 @@ AUDIT_FIELDS = [
     "timestamp_delta_seconds",
     "spotify_added_cluster_size",
     "timestamp_suspect_reason",
+    "tidal_source_occurrences",
+    "tidal_source_duplicate_conflict",
+    "spotify_source_occurrences",
+    "spotify_source_duplicate_conflict",
 ]
 
 
@@ -43,11 +48,16 @@ class AuditStageError(RuntimeError):
 
 
 def _tidal_date_added(track) -> datetime.datetime | None:
-    value = (
-        getattr(track, "date_added", None)
-        or getattr(track, "user_date_added", None)
-    )
-    return value if isinstance(value, datetime.datetime) else None
+    values = [
+        value for value in (
+            getattr(track, "date_added", None),
+            getattr(track, "user_date_added", None),
+        )
+        if isinstance(value, datetime.datetime)
+    ]
+    if not values:
+        return None
+    return min(_parse_spotify_datetime(value) for value in values)
 
 
 def _parse_spotify_datetime(value) -> datetime.datetime | None:
@@ -79,15 +89,133 @@ def _spotify_metadata(track: dict) -> tuple[str, str, str]:
     return isrc, artists, track.get("name", "")
 
 
+def _normalized_text(value: object) -> str:
+    return " ".join(str(value or "").casefold().split())
+
+
+def _tidal_track_signature(track) -> tuple:
+    isrc, artists, title = _tidal_metadata(track)
+    return (
+        _normalized_text(isrc),
+        _normalized_text(artists),
+        _normalized_text(title),
+        round(float(getattr(track, "duration", 0) or 0), 3),
+        _normalized_text(getattr(track, "version", None)),
+    )
+
+
+def _spotify_track_signature(track: dict) -> tuple:
+    isrc, artists, title = _spotify_metadata(track)
+    return (
+        _normalized_text(isrc),
+        _normalized_text(artists),
+        _normalized_text(title),
+        int(track.get("duration_ms", 0) or 0),
+    )
+
+
+def _deduplicate_tidal_tracks(
+    tidal_tracks: Sequence,
+) -> tuple[list[object], dict[str, dict[str, object]]]:
+    """Collapse repeated collection resources and retain their earliest timestamp."""
+    groups: dict[str, list[object]] = {}
+    order: list[str] = []
+    for index, track in enumerate(tidal_tracks):
+        raw_id = getattr(track, "id", None)
+        key = str(raw_id) if raw_id not in {None, ""} else f"__missing_id_{index}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(track)
+
+    unique: list[object] = []
+    info: dict[str, dict[str, object]] = {}
+    for key in order:
+        tracks = groups[key]
+        representative = min(
+            tracks,
+            key=lambda track: (
+                _tidal_date_added(track) is None,
+                _tidal_date_added(track) or datetime.datetime.max.replace(
+                    tzinfo=datetime.timezone.utc
+                ),
+                -sum(bool(part) for part in _tidal_track_signature(track)),
+            ),
+        )
+        dates = {
+            spotify_added_at(value)
+            for track in tracks
+            if (value := _tidal_date_added(track)) is not None
+        }
+        signatures = {_tidal_track_signature(track) for track in tracks}
+        conflicts = []
+        if len(dates) > 1:
+            conflicts.append("date_added_conflict")
+        if len(signatures) > 1:
+            conflicts.append("metadata_conflict")
+        unique.append(representative)
+        info[str(getattr(representative, "id", ""))] = {
+            "occurrences": len(tracks),
+            "conflict": ";".join(conflicts),
+        }
+    return unique, info
+
+
+def _deduplicate_spotify_saved_items(
+    spotify_saved_items: Sequence[dict],
+) -> tuple[list[dict], dict[str, dict[str, object]]]:
+    """Defensively collapse repeated saved-track resources by Spotify track ID."""
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for index, item in enumerate(spotify_saved_items):
+        track = item.get("track")
+        if track is None:
+            continue
+        raw_id = track.get("id")
+        key = str(raw_id) if raw_id not in {None, ""} else f"__missing_id_{index}"
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+
+    unique: list[dict] = []
+    info: dict[str, dict[str, object]] = {}
+    for key in order:
+        items = groups[key]
+        representative = min(
+            items,
+            key=lambda item: (
+                _parse_spotify_datetime(item.get("added_at")) is None,
+                _parse_spotify_datetime(item.get("added_at"))
+                or datetime.datetime.max.replace(tzinfo=datetime.timezone.utc),
+            ),
+        )
+        dates = {
+            spotify_added_at(value)
+            for item in items
+            if (value := _parse_spotify_datetime(item.get("added_at"))) is not None
+        }
+        signatures = {_spotify_track_signature(item["track"]) for item in items}
+        conflicts = []
+        if len(dates) > 1:
+            conflicts.append("added_at_conflict")
+        if len(signatures) > 1:
+            conflicts.append("metadata_conflict")
+        unique.append(representative)
+        info[str(representative["track"].get("id", ""))] = {
+            "occurrences": len(items),
+            "conflict": ";".join(conflicts),
+        }
+    return unique, info
+
+
 def _pair_saved_favorites(
     tidal_tracks: Sequence,
     spotify_saved_items: Sequence[dict],
 ) -> tuple[list[tuple[object, dict]], list[object], list[dict]]:
     """Pair saved-library entries one-to-one using the existing match predicate."""
-    usable_items = [
-        item for item in spotify_saved_items
-        if item.get("track") is not None
-    ]
+    tidal_tracks, _ = _deduplicate_tidal_tracks(tidal_tracks)
+    usable_items, _ = _deduplicate_spotify_saved_items(spotify_saved_items)
     available = set(range(len(usable_items)))
     spotify_by_isrc: dict[str, list[int]] = defaultdict(list)
     for index, item in enumerate(usable_items):
@@ -127,15 +255,37 @@ def build_favorites_audit_rows(
     *,
     mismatch_days: int = 30,
     cluster_size: int = 3,
+    cluster_min_delta_hours: int = 24,
 ) -> list[dict]:
     """Build audit rows without making network calls or modifying either account."""
     catalog_matches = catalog_matches or {}
+    tidal_tracks, tidal_source_info = _deduplicate_tidal_tracks(tidal_tracks)
+    spotify_saved_items, spotify_source_info = _deduplicate_spotify_saved_items(
+        spotify_saved_items
+    )
     pairs, tidal_unmatched, spotify_unmatched = _pair_saved_favorites(
         tidal_tracks,
         spotify_saved_items,
     )
     rows: list[dict] = []
     mismatch_seconds = mismatch_days * 24 * 60 * 60
+    cluster_min_delta_seconds = cluster_min_delta_hours * 60 * 60
+
+    def source_fields(tidal_track=None, spotify_track=None) -> dict:
+        tidal_info = tidal_source_info.get(
+            str(getattr(tidal_track, "id", "")),
+            {"occurrences": "", "conflict": ""},
+        )
+        spotify_info = spotify_source_info.get(
+            str(spotify_track.get("id", "")) if spotify_track else "",
+            {"occurrences": "", "conflict": ""},
+        )
+        return {
+            "tidal_source_occurrences": tidal_info["occurrences"],
+            "tidal_source_duplicate_conflict": tidal_info["conflict"],
+            "spotify_source_occurrences": spotify_info["occurrences"],
+            "spotify_source_duplicate_conflict": spotify_info["conflict"],
+        }
 
     for tidal_track, spotify_item in pairs:
         spotify_track = spotify_item["track"]
@@ -159,6 +309,7 @@ def build_favorites_audit_rows(
         rows.append({
             "tidal_id": str(tidal_track.id),
             "spotify_id": spotify_track.get("id", ""),
+            "spotify_catalog_candidate_id": "",
             "isrc": isrc or _spotify_metadata(spotify_track)[0],
             "artist": artist,
             "title": title,
@@ -168,6 +319,7 @@ def build_favorites_audit_rows(
             "timestamp_delta_seconds": delta if delta is not None else "",
             "spotify_added_cluster_size": "",
             "timestamp_suspect_reason": reason,
+            **source_fields(tidal_track, spotify_track),
         })
 
     for tidal_track in tidal_unmatched:
@@ -176,7 +328,10 @@ def build_favorites_audit_rows(
         tidal_date = _tidal_date_added(tidal_track)
         rows.append({
             "tidal_id": str(tidal_track.id),
-            "spotify_id": catalog_track.get("id", "") if catalog_track else "",
+            "spotify_id": "",
+            "spotify_catalog_candidate_id": (
+                catalog_track.get("id", "") if catalog_track else ""
+            ),
             "isrc": isrc,
             "artist": artist,
             "title": title,
@@ -186,6 +341,7 @@ def build_favorites_audit_rows(
             "timestamp_delta_seconds": "",
             "spotify_added_cluster_size": "",
             "timestamp_suspect_reason": "missing_tidal_date_added" if tidal_date is None else "",
+            **source_fields(tidal_track),
         })
 
     for spotify_item in spotify_unmatched:
@@ -195,6 +351,7 @@ def build_favorites_audit_rows(
         rows.append({
             "tidal_id": "",
             "spotify_id": spotify_track.get("id", ""),
+            "spotify_catalog_candidate_id": "",
             "isrc": isrc,
             "artist": artist,
             "title": title,
@@ -204,22 +361,60 @@ def build_favorites_audit_rows(
             "timestamp_delta_seconds": "",
             "spotify_added_cluster_size": "",
             "timestamp_suspect_reason": "",
+            **source_fields(spotify_track=spotify_track),
         })
 
-    mismatches_by_day = Counter(
-        row["spotify_added_at"][:10]
+    spotify_additions_by_minute = Counter(
+        row["spotify_added_at"][:16]
         for row in rows
-        if row["status"] == "timestamp_mismatch" and row["spotify_added_at"]
+        if row["spotify_id"] and row["spotify_added_at"]
     )
     for row in rows:
-        if row["status"] != "timestamp_mismatch":
+        if not row["spotify_id"] or not row["spotify_added_at"]:
             continue
-        count = mismatches_by_day[row["spotify_added_at"][:10]]
+        count = spotify_additions_by_minute[row["spotify_added_at"][:16]]
         row["spotify_added_cluster_size"] = count
-        if count >= cluster_size:
-            row["timestamp_suspect_reason"] += ";clustered_spotify_added_at"
+        delta = row["timestamp_delta_seconds"]
+        clustered_mismatch = (
+            row["tidal_id"]
+            and isinstance(delta, int)
+            and delta > cluster_min_delta_seconds
+            and count >= cluster_size
+        )
+        if clustered_mismatch:
+            if row["status"] == "matched":
+                row["status"] = "timestamp_mismatch"
+                row["timestamp_suspect_reason"] = "spotify_added_later_than_tidal_in_cluster"
+            if "clustered_spotify_added_at" not in row["timestamp_suspect_reason"]:
+                separator = ";" if row["timestamp_suspect_reason"] else ""
+                row["timestamp_suspect_reason"] += f"{separator}clustered_spotify_added_at"
 
     return rows
+
+
+def audit_integrity_warnings(rows: Sequence[dict]) -> list[str]:
+    """Summarize source duplicates that were safely collapsed in the report."""
+    warnings = []
+    for provider, label in (("tidal", "Tidal"), ("spotify", "Spotify")):
+        occurrences_field = f"{provider}_source_occurrences"
+        conflict_field = f"{provider}_source_duplicate_conflict"
+        duplicated = [
+            row for row in rows
+            if int(row.get(occurrences_field) or 0) > 1
+        ]
+        if duplicated:
+            extra = sum(int(row[occurrences_field]) - 1 for row in duplicated)
+            warnings.append(
+                f"Collapsed {extra} duplicate {label} collection records across "
+                f"{len(duplicated)} IDs; the earliest timestamp was retained."
+            )
+        conflicts = sum(bool(row.get(conflict_field)) for row in duplicated)
+        if conflicts:
+            warnings.append(
+                f"{conflicts} duplicated {label} IDs had conflicting source data; "
+                "inspect the CSV conflict column before planning changes."
+            )
+    return warnings
 
 
 async def _catalog_matches_for_unmatched(
@@ -389,6 +584,10 @@ async def collect_favorites_audit_rows_from_tracks(
             catalog_matches,
             mismatch_days=config.get("audit_timestamp_mismatch_days", 30),
             cluster_size=config.get("audit_timestamp_cluster_size", 3),
+            cluster_min_delta_hours=config.get(
+                "audit_timestamp_cluster_min_delta_hours",
+                24,
+            ),
         )
     except Exception as exc:
         raise AuditStageError(
