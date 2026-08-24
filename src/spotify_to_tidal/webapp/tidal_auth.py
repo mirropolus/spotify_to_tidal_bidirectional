@@ -12,7 +12,7 @@ import math
 import random
 import re
 import secrets
-from typing import Any, Iterable
+from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
 
 import httpx
@@ -22,7 +22,6 @@ TIDAL_AUTHORIZE_URL = "https://login.tidal.com/authorize"
 TIDAL_TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
 TIDAL_OPENAPI_BASE_URL = "https://openapi.tidal.com/v2"
 TIDAL_AUDIT_SCOPES = ("collection.read",)
-TIDAL_CATALOG_BATCH_SIZE = 50
 TIDAL_STATUS_MAX_RETRIES = 3
 TIDAL_STATUS_RETRY_BASE_SECONDS = 0.5
 TIDAL_STATUS_RETRY_MAX_SECONDS = 16.0
@@ -181,11 +180,6 @@ def _duration_seconds(value: Any) -> float:
     )
 
 
-def _batches(values: list[str], size: int) -> Iterable[list[str]]:
-    for start in range(0, len(values), size):
-        yield values[start:start + size]
-
-
 def _retry_after_seconds(
     value: str | None,
     *,
@@ -251,16 +245,11 @@ class TidalOpenAPIClient:
     def __init__(
         self,
         credentials: TidalCredentials,
-        client_id: str,
-        client_secret: str,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._credentials = credentials
-        self._client_id = client_id
-        self._client_secret = client_secret
         self._transport = transport
-        self._catalog_token: str | None = None
 
     async def _get_with_retry(
         self,
@@ -297,38 +286,11 @@ class TidalOpenAPIClient:
             await asyncio.sleep(max(backoff, retry_after or 0.0))
             retries += 1
 
-    async def _catalog_access_token(self, client: httpx.AsyncClient) -> str:
-        if self._catalog_token:
-            return self._catalog_token
-        try:
-            response = await client.post(
-                TIDAL_TOKEN_URL,
-                data={
-                    "client_id": self._client_id,
-                    "client_secret": self._client_secret,
-                    "grant_type": "client_credentials",
-                },
-                headers={"Accept": "application/json"},
-            )
-            if response.is_error:
-                raise TidalAPIError(
-                    f"Tidal catalog authorization failed (HTTP {response.status_code})"
-                )
-            payload = response.json()
-        except TidalAPIError:
-            raise
-        except httpx.RequestError as exc:
-            raise TidalAPIError("Tidal catalog authorization network request failed") from exc
-        except ValueError as exc:
-            raise TidalAPIError("Tidal catalog authorization returned invalid JSON") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str):
-            raise TidalAPIError("Tidal returned an invalid catalog token response")
-        self._catalog_token = payload["access_token"]
-        return self._catalog_token
-
     async def favorite_tracks(self) -> list[TidalAuditTrack]:
         """Load favorites and their historical addedAt using official OpenAPI GETs."""
         collection: list[tuple[str, datetime.datetime | None]] = []
+        resources: dict[str, dict] = {}
+        artists: dict[str, str] = {}
         user_headers = {
             "Authorization": f"Bearer {self._credentials.access_token}",
             "Accept": _JSON_API_MEDIA_TYPE,
@@ -336,7 +298,10 @@ class TidalOpenAPIClient:
         url: str | None = (
             f"{TIDAL_OPENAPI_BASE_URL}/userCollectionTracks/me/relationships/items"
         )
-        params: dict[str, str] | None = {"sort": "addedAt"}
+        params: dict[str, str] | None = {
+            "sort": "addedAt",
+            "include": "items.artists",
+        }
 
         stage = "Tidal collection page request"
         try:
@@ -370,6 +335,19 @@ class TidalOpenAPIClient:
                             str(item["id"]),
                             _parse_datetime((item.get("meta") or {}).get("addedAt")),
                         ))
+                    included_resources = payload.get("included") or []
+                    if not isinstance(included_resources, list):
+                        raise TidalAPIError("Tidal returned invalid included metadata")
+                    for included in included_resources:
+                        if not isinstance(included, dict) or not included.get("id"):
+                            raise TidalAPIError("Tidal returned invalid included metadata")
+                        included_id = str(included["id"])
+                        if included.get("type") == "tracks":
+                            resources[included_id] = included
+                        elif included.get("type") == "artists":
+                            name = (included.get("attributes") or {}).get("name")
+                            if isinstance(name, str):
+                                artists[included_id] = name
                     url = _safe_next_url(
                         (payload.get("links") or {}).get("next"),
                         current_url,
@@ -378,50 +356,6 @@ class TidalOpenAPIClient:
 
                 if not collection:
                     return []
-
-                catalog_token = await self._catalog_access_token(client)
-                catalog_headers = {
-                    "Authorization": f"Bearer {catalog_token}",
-                    "Accept": _JSON_API_MEDIA_TYPE,
-                }
-                resources: dict[str, dict] = {}
-                artists: dict[str, str] = {}
-                for batch in _batches([track_id for track_id, _ in collection], TIDAL_CATALOG_BATCH_SIZE):
-                    stage = "Tidal catalog metadata request"
-                    query: list[tuple[str, str]] = [("filter[id]", item) for item in batch]
-                    query.append(("include", "artists"))
-                    response = await self._get_with_retry(
-                        client,
-                        f"{TIDAL_OPENAPI_BASE_URL}/tracks",
-                        stage=stage,
-                        params=query,
-                        headers=catalog_headers,
-                    )
-                    if response.is_error:
-                        retry_suffix = (
-                            f" after {TIDAL_STATUS_MAX_RETRIES} retries"
-                            if response.status_code == 429
-                            or 500 <= response.status_code < 600
-                            else ""
-                        )
-                        raise TidalAPIError(
-                            f"{stage} failed{retry_suffix} (HTTP {response.status_code})"
-                        )
-                    payload = response.json()
-                    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
-                        raise TidalAPIError("Tidal returned an invalid catalog response")
-                    for resource in payload["data"]:
-                        if isinstance(resource, dict) and resource.get("id"):
-                            resources[str(resource["id"])] = resource
-                    for included in payload.get("included") or []:
-                        if (
-                            isinstance(included, dict)
-                            and included.get("type") == "artists"
-                            and included.get("id")
-                        ):
-                            name = (included.get("attributes") or {}).get("name")
-                            if isinstance(name, str):
-                                artists[str(included["id"])] = name
         except TidalAPIError:
             raise
         except httpx.RequestError as exc:
@@ -433,7 +367,7 @@ class TidalOpenAPIClient:
         for track_id, added_at in collection:
             resource = resources.get(track_id)
             if resource is None:
-                raise TidalAPIError("Tidal catalog metadata was incomplete")
+                raise TidalAPIError("Tidal collection metadata was incomplete")
             attributes = resource.get("attributes") or {}
             artist_ids = (
                 ((resource.get("relationships") or {}).get("artists") or {}).get("data")

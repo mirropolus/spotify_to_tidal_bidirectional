@@ -63,10 +63,11 @@ relationship:
 
 `GET /v2/userCollectionTracks/me/relationships/items`
 
-Catalog metadata is fetched with read-only `GET /v2/tracks` calls using the
-application's client-credentials token. The user token is used only for My
-Collection. The web path does not use `tidalapi`, legacy `api.tidal.com/v1`
-favorites, the internal-only Device Login flow, or the internal `r_usr` scope.
+Track and artist metadata is included directly in the paginated collection
+relationship response with `include=items.artists`. This avoids a separate
+catalog lookup and reduces the number of provider requests. The web path does
+not use `tidalapi`, legacy `api.tidal.com/v1` favorites, the internal-only
+Device Login flow, or the internal `r_usr` scope.
 
 ## 2. Run locally
 

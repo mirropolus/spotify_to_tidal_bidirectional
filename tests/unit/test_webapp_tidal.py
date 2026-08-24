@@ -141,6 +141,7 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
         requests.append(request)
         if request.url.path.endswith("/userCollectionTracks/me/relationships/items"):
             assert request.headers["Authorization"] == "Bearer user-access-token"
+            assert request.url.params.get("include") == "items.artists"
             if request.url.params.get("page[cursor]") == "second":
                 return httpx.Response(200, json={
                     "data": [{
@@ -148,6 +149,28 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
                         "type": "tracks",
                         "meta": {"addedAt": "2022-06-01T08:15:00+02:00"},
                     }],
+                    "included": [
+                        {
+                            "id": "track-2",
+                            "type": "tracks",
+                            "attributes": {
+                                "isrc": "ISRC2",
+                                "title": "Second track",
+                                "duration": "PT4M",
+                                "version": "Live",
+                            },
+                            "relationships": {
+                                "artists": {
+                                    "data": [{"id": "artist-2", "type": "artists"}]
+                                }
+                            },
+                        },
+                        {
+                            "id": "artist-2",
+                            "type": "artists",
+                            "attributes": {"name": "Two"},
+                        },
+                    ],
                     "links": {"next": None},
                 })
             assert request.url.params.get("sort") == "addedAt"
@@ -157,22 +180,7 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
                     "type": "tracks",
                     "meta": {"addedAt": "2021-05-12T14:32:10Z"},
                 }],
-                    "links": {
-                    "next": (
-                        "/userCollectionTracks/me/relationships/items"
-                        "?page%5Bcursor%5D=second"
-                    )
-                },
-            })
-        if str(request.url) == TIDAL_TOKEN_URL:
-            assert parse_qs(request.content.decode())["grant_type"] == ["client_credentials"]
-            return httpx.Response(200, json={"access_token": "catalog-access-token"})
-        if request.url.path.endswith("/tracks"):
-            assert request.headers["Authorization"] == "Bearer catalog-access-token"
-            assert request.url.params.get_list("filter[id]") == ["track-1", "track-2"]
-            assert request.url.params.get("include") == "artists"
-            return httpx.Response(200, json={
-                "data": [
+                "included": [
                     {
                         "id": "track-1",
                         "type": "tracks",
@@ -182,28 +190,23 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
                             "duration": "PT3M1.5S",
                         },
                         "relationships": {
-                            "artists": {"data": [{"id": "artist-1", "type": "artists"}]}
+                            "artists": {
+                                "data": [{"id": "artist-1", "type": "artists"}]
+                            }
                         },
                     },
                     {
-                        "id": "track-2",
-                        "type": "tracks",
-                        "attributes": {
-                            "isrc": "ISRC2",
-                            "title": "Second track",
-                            "duration": "PT4M",
-                            "version": "Live",
-                        },
-                        "relationships": {
-                            "artists": {"data": [{"id": "artist-2", "type": "artists"}]}
-                        },
+                        "id": "artist-1",
+                        "type": "artists",
+                        "attributes": {"name": "One"},
                     },
                 ],
-                "included": [
-                    {"id": "artist-1", "type": "artists", "attributes": {"name": "One"}},
-                    {"id": "artist-2", "type": "artists", "attributes": {"name": "Two"}},
-                ],
-                "links": {},
+                    "links": {
+                    "next": (
+                        "/userCollectionTracks/me/relationships/items"
+                        "?page%5Bcursor%5D=second&include=items.artists"
+                    )
+                },
             })
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
@@ -216,8 +219,6 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
     )
     client = TidalOpenAPIClient(
         credentials,
-        "client-id",
-        "client-secret",
         transport=httpx.MockTransport(handler),
     )
 
@@ -234,18 +235,9 @@ def test_openapi_favorites_uses_collection_relationship_and_only_read_requests()
     assert tracks[0].artists[0].name == "One"
     assert tracks[1].version == "Live"
     provider_requests = [request for request in requests if "tidal.com" in request.url.host]
-    assert all(
-        request.method == "GET" or request.url.path == "/v1/oauth2/token"
-        for request in provider_requests
-    )
-    assert not any(
-        request.method in {"DELETE", "PATCH", "PUT"}
-        or (
-            request.method == "POST"
-            and "userCollection" in request.url.path
-        )
-        for request in provider_requests
-    )
+    assert len(provider_requests) == 2
+    assert all(request.method == "GET" for request in provider_requests)
+    assert not any(request.url.path.endswith("/tracks") for request in provider_requests)
 
 
 def test_retry_after_supports_delay_seconds_and_http_date():
@@ -288,8 +280,6 @@ def test_openapi_collection_retries_429_and_honors_retry_after(mocker):
             expires_at=None,
             scope="collection.read",
         ),
-        "client-id",
-        "client-secret",
         transport=httpx.MockTransport(handler),
     )
 
@@ -319,8 +309,6 @@ def test_openapi_collection_reports_429_after_bounded_retries(mocker):
             expires_at=None,
             scope="collection.read",
         ),
-        "client-id",
-        "client-secret",
         transport=httpx.MockTransport(handler),
     )
 
@@ -355,8 +343,6 @@ def test_openapi_collection_does_not_wait_on_excessive_retry_after(mocker):
             expires_at=None,
             scope="collection.read",
         ),
-        "client-id",
-        "client-secret",
         transport=httpx.MockTransport(handler),
     )
 
@@ -388,37 +374,10 @@ def test_openapi_pagination_rejects_untrusted_destinations(unsafe_link):
         )
 
 
-@pytest.mark.parametrize(
-    ("failing_stage", "status", "expected_message"),
-    [
-        ("collection", 403, "Tidal collection page request failed (HTTP 403)"),
-        ("catalog_token", 401, "Tidal catalog authorization failed (HTTP 401)"),
-        ("catalog", 400, "Tidal catalog metadata request failed (HTTP 400)"),
-    ],
-)
-def test_openapi_errors_identify_safe_stage_and_status(
-    failing_stage,
-    status,
-    expected_message,
-):
+def test_openapi_errors_identify_safe_stage_and_status():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path.endswith("/userCollectionTracks/me/relationships/items"):
-            if failing_stage == "collection":
-                return httpx.Response(status, json={"secret": "not-disclosed"})
-            return httpx.Response(200, json={
-                "data": [{
-                    "id": "track-1",
-                    "type": "tracks",
-                    "meta": {"addedAt": "2021-05-12T14:32:10Z"},
-                }],
-                "links": {"next": None},
-            })
-        if str(request.url) == TIDAL_TOKEN_URL:
-            if failing_stage == "catalog_token":
-                return httpx.Response(status, json={"secret": "not-disclosed"})
-            return httpx.Response(200, json={"access_token": "catalog-token"})
-        if request.url.path.endswith("/tracks") and failing_stage == "catalog":
-            return httpx.Response(status, json={"secret": "not-disclosed"})
+            return httpx.Response(403, json={"secret": "not-disclosed"})
         raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
     client = TidalOpenAPIClient(
@@ -429,13 +388,40 @@ def test_openapi_errors_identify_safe_stage_and_status(
             expires_at=None,
             scope="collection.read",
         ),
-        "client-id",
-        "client-secret",
         transport=httpx.MockTransport(handler),
     )
 
     with pytest.raises(TidalAPIError) as exc_info:
         asyncio.run(client.favorite_tracks())
 
-    assert str(exc_info.value) == expected_message
+    assert str(exc_info.value) == "Tidal collection page request failed (HTTP 403)"
     assert "not-disclosed" not in str(exc_info.value)
+
+
+def test_openapi_reports_missing_included_track_metadata():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/userCollectionTracks/me/relationships/items"):
+            return httpx.Response(200, json={
+                "data": [{
+                    "id": "track-1",
+                    "type": "tracks",
+                    "meta": {"addedAt": "2021-05-12T14:32:10Z"},
+                }],
+                "included": [],
+                "links": {"next": None},
+            })
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = TidalOpenAPIClient(
+        TidalCredentials(
+            access_token="user-token",
+            refresh_token=None,
+            token_type="Bearer",
+            expires_at=None,
+            scope="collection.read",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TidalAPIError, match="collection metadata was incomplete"):
+        asyncio.run(client.favorite_tracks())

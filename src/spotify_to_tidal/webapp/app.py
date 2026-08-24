@@ -368,8 +368,6 @@ def create_app(
                 )
                 browser.tidal_client = TidalOpenAPIClient(
                     credentials,
-                    settings.tidal_client_id or "",
-                    settings.tidal_client_secret or "",
                 )
                 browser.notice = "Tidal connected with read-only authorization."
                 browser.clear_report()
