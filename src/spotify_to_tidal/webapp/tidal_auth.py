@@ -244,10 +244,17 @@ class TidalOpenAPIClient:
                 },
                 headers={"Accept": "application/json"},
             )
-            response.raise_for_status()
+            if response.is_error:
+                raise TidalAPIError(
+                    f"Tidal catalog authorization failed (HTTP {response.status_code})"
+                )
             payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise TidalAPIError("Tidal catalog authorization failed") from exc
+        except TidalAPIError:
+            raise
+        except httpx.RequestError as exc:
+            raise TidalAPIError("Tidal catalog authorization network request failed") from exc
+        except ValueError as exc:
+            raise TidalAPIError("Tidal catalog authorization returned invalid JSON") from exc
         if not isinstance(payload, dict) or not isinstance(payload.get("access_token"), str):
             raise TidalAPIError("Tidal returned an invalid catalog token response")
         self._catalog_token = payload["access_token"]
@@ -265,12 +272,16 @@ class TidalOpenAPIClient:
         )
         params: dict[str, str] | None = {"sort": "addedAt"}
 
+        stage = "Tidal collection page request"
         try:
             async with httpx.AsyncClient(timeout=20, transport=self._transport) as client:
                 while url:
                     current_url = url
                     response = await client.get(url, params=params, headers=user_headers)
-                    response.raise_for_status()
+                    if response.is_error:
+                        raise TidalAPIError(
+                            f"{stage} failed (HTTP {response.status_code})"
+                        )
                     payload = response.json()
                     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                         raise TidalAPIError("Tidal returned an invalid collection response")
@@ -298,6 +309,7 @@ class TidalOpenAPIClient:
                 resources: dict[str, dict] = {}
                 artists: dict[str, str] = {}
                 for batch in _batches([track_id for track_id, _ in collection], TIDAL_CATALOG_BATCH_SIZE):
+                    stage = "Tidal catalog metadata request"
                     query: list[tuple[str, str]] = [("filter[id]", item) for item in batch]
                     query.append(("include", "artists"))
                     response = await client.get(
@@ -305,7 +317,10 @@ class TidalOpenAPIClient:
                         params=query,
                         headers=catalog_headers,
                     )
-                    response.raise_for_status()
+                    if response.is_error:
+                        raise TidalAPIError(
+                            f"{stage} failed (HTTP {response.status_code})"
+                        )
                     payload = response.json()
                     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
                         raise TidalAPIError("Tidal returned an invalid catalog response")
@@ -323,8 +338,10 @@ class TidalOpenAPIClient:
                                 artists[str(included["id"])] = name
         except TidalAPIError:
             raise
-        except (httpx.HTTPError, ValueError) as exc:
-            raise TidalAPIError("Tidal read-only collection request failed") from exc
+        except httpx.RequestError as exc:
+            raise TidalAPIError(f"{stage} could not reach Tidal") from exc
+        except ValueError as exc:
+            raise TidalAPIError(f"{stage} returned invalid JSON") from exc
 
         tracks: list[TidalAuditTrack] = []
         for track_id, added_at in collection:

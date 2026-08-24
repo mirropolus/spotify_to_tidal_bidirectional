@@ -263,3 +263,56 @@ def test_openapi_pagination_rejects_untrusted_destinations(unsafe_link):
             unsafe_link,
             f"{TIDAL_OPENAPI_BASE_URL}/userCollectionTracks/me/relationships/items",
         )
+
+
+@pytest.mark.parametrize(
+    ("failing_stage", "status", "expected_message"),
+    [
+        ("collection", 403, "Tidal collection page request failed (HTTP 403)"),
+        ("catalog_token", 401, "Tidal catalog authorization failed (HTTP 401)"),
+        ("catalog", 400, "Tidal catalog metadata request failed (HTTP 400)"),
+    ],
+)
+def test_openapi_errors_identify_safe_stage_and_status(
+    failing_stage,
+    status,
+    expected_message,
+):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/userCollectionTracks/me/relationships/items"):
+            if failing_stage == "collection":
+                return httpx.Response(status, json={"secret": "not-disclosed"})
+            return httpx.Response(200, json={
+                "data": [{
+                    "id": "track-1",
+                    "type": "tracks",
+                    "meta": {"addedAt": "2021-05-12T14:32:10Z"},
+                }],
+                "links": {"next": None},
+            })
+        if str(request.url) == TIDAL_TOKEN_URL:
+            if failing_stage == "catalog_token":
+                return httpx.Response(status, json={"secret": "not-disclosed"})
+            return httpx.Response(200, json={"access_token": "catalog-token"})
+        if request.url.path.endswith("/tracks") and failing_stage == "catalog":
+            return httpx.Response(status, json={"secret": "not-disclosed"})
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = TidalOpenAPIClient(
+        TidalCredentials(
+            access_token="user-token",
+            refresh_token=None,
+            token_type="Bearer",
+            expires_at=None,
+            scope="collection.read",
+        ),
+        "client-id",
+        "client-secret",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(TidalAPIError) as exc_info:
+        asyncio.run(client.favorite_tracks())
+
+    assert str(exc_info.value) == expected_message
+    assert "not-disclosed" not in str(exc_info.value)
