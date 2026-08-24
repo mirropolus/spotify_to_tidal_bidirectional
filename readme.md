@@ -161,28 +161,48 @@ python3.11 -m spotify_to_tidal \
   --audit-output reports/favorites_audit.csv
 ```
 
-The CSV contains Tidal and Spotify IDs, ISRC, artist, title, both service
-timestamps, signed timestamp delta, status, same-day cluster size, and a
-suspicion reason. Statuses are:
+The CSV contains actual saved-library IDs, a separate Spotify catalog-candidate
+ID, ISRC, artist, title, both service timestamps, signed timestamp delta,
+minute-level Spotify cluster size, source occurrence/conflict fields, and a
+suspicion reason. `spotify_id` is populated only when the item is actually in
+Liked Songs; `spotify_catalog_candidate_id` is only a search result for a
+Tidal-only favorite.
+
+Presence is evaluated many-to-many with the same semantic matcher used by sync.
+Alternative provider IDs for the same recording are listed in
+`matched_tidal_ids` and `matched_spotify_ids`; they are not incorrectly counted
+as service-only entries. Match counts, `timestamp_reference_tidal_id`, and
+`match_ambiguity` make version and historical-date ambiguity explicit.
+
+Repeated collection resources with the same provider track ID are collapsed
+before matching, so the report contains no duplicate saved-library IDs. The
+earliest historical timestamp is retained. The source occurrence and conflict
+columns make that normalization explicit, and the web app also shows an
+integrity warning when it occurs. Statuses are:
 
 | Status | Meaning |
 |---|---|
 | `matched` | Present in both saved libraries; no suspicious later Spotify timestamp detected |
+| `matched_equivalent` | An additional provider ID maps to a recording already present on the other service |
 | `timestamp_mismatch` | Present in both, but Spotify was added much later than Tidal |
 | `tidal_only` | Saved only in Tidal and a Spotify catalog equivalent was found |
 | `spotify_only` | Saved only in Spotify |
 | `match_failed` | Saved in Tidal but no safe Spotify catalog match was found |
 
 By default, a timestamp is suspicious when Spotify is more than 30 days later
-than Tidal. Three or more suspicious additions on the same Spotify calendar day
-are also marked as a cluster. These heuristics can be adjusted in `config.yml`:
+than Tidal. The audit also detects bursts across all Spotify likes: when at
+least three likes share the same UTC minute, a paired item added more than 24
+hours after its Tidal timestamp is flagged even if it falls short of 30 days.
+Same-day pairs remain matched. These heuristics can be adjusted in `config.yml`:
 
 ```yaml
 audit_timestamp_mismatch_days: 30
 audit_timestamp_cluster_size: 3
+audit_timestamp_cluster_min_delta_hours: 24
 ```
 
 The report is diagnostic only. It does not remove/re-add likes or repair dates.
+Rows with `match_ambiguity` must not be used as automatic repair instructions.
 
 ---
 
@@ -287,6 +307,46 @@ any recurring execution. The daily `schedule` trigger is intentionally omitted
 for now and should be added in a later change only after that manual run has
 been validated. Playlist synchronization should remain out of this workflow
 until it is reviewed separately.
+
+---
+
+## Mobile read-only audit app
+
+The optional **Favorite Bridge Audit** PWA provides a phone-friendly OAuth and
+audit flow without asking users to copy access or refresh tokens. It connects
+to Spotify with PKCE and `user-library-read`, and to Tidal with Authorization
+Code + PKCE limited to the public read-only `collection.read` scope. Tidal
+favorites and their historical timestamps are loaded through the official
+OpenAPI `userCollectionTracks` relationship; the PWA does not use Tidal Device
+Login or legacy `tidalapi` favorites endpoints. It then runs the existing
+matching audit and lets the user download `favorites_audit.csv`.
+
+It contains no synchronization or library-write routes. Tokens and generated
+reports remain only in process memory and expire with the browser session.
+
+Install and start it locally with:
+
+```bash
+python -m pip install -e ".[web]"
+export AUDIT_WEB_BASE_URL=http://127.0.0.1:8765
+export SPOTIFY_CLIENT_ID=your_spotify_client_id
+export TIDAL_CLIENT_ID=your_tidal_client_id
+export TIDAL_CLIENT_SECRET=your_tidal_client_secret
+spotify_to_tidal_web
+```
+
+Register these exact redirect URIs in the respective developer dashboards:
+
+- Spotify: `http://127.0.0.1:8765/auth/spotify/callback`
+- Tidal: `http://127.0.0.1:8765/auth/tidal/callback`
+
+Open `http://127.0.0.1:8765`, connect both accounts and run the audit. Hosted
+deployments must register the same callback paths under their exact HTTPS
+`AUDIT_WEB_BASE_URL` origin.
+
+See [the mobile audit application guide](docs/mobile-audit.md) for provider
+registration, Docker usage, mobile/HTTPS deployment, CSV fields and security
+limitations.
 
 ---
 

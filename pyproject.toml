@@ -19,9 +19,25 @@ dependencies = [
   "hypothesis~=6.0"
 ]
 
+[project.optional-dependencies]
+web = [
+  "fastapi>=0.116,<0.117",
+  "httpx>=0.28,<0.29",
+  "jinja2>=3.1,<4",
+  "python-multipart>=0.0.20,<0.1",
+  "uvicorn>=0.35,<0.36",
+]
+
 [tools.setuptools.packages."spotify_to_tidal"]
 where = "src"
 include = "spotify_to_tidal*"
 
 [project.scripts]
 spotify_to_tidal = "spotify_to_tidal.__main__:main"
+spotify_to_tidal_web = "spotify_to_tidal.webapp:main"
+
+[tool.setuptools.package-data]
+spotify_to_tidal = [
+  "webapp/static/*",
+  "webapp/templates/*",
+]
