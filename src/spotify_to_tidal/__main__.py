@@ -4,12 +4,23 @@ import sys
 
 from . import sync as _sync
 from . import auth as _auth
+from . import audit as _audit
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--config', default='config.yml', help='location of the config file')
     parser.add_argument('--uri', help='synchronize a specific URI instead of the one in the config')
     parser.add_argument('--sync-favorites', action=argparse.BooleanOptionalAction, help='synchronize the favorites')
+    parser.add_argument(
+        '--audit-favorites',
+        action='store_true',
+        help='compare Tidal favorites and Spotify Liked Songs without modifying either account',
+    )
+    parser.add_argument(
+        '--audit-output',
+        default='favorites_audit.csv',
+        help='CSV path for --audit-favorites (default: favorites_audit.csv)',
+    )
     parser.add_argument(
         '--sync-direction',
         dest='sync_direction',
@@ -20,7 +31,25 @@ def main():
     args = parser.parse_args()
 
     with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+
+    if args.audit_favorites:
+        print("Opening read-only Spotify session")
+        spotify_session = _auth.open_spotify_session(
+            config['spotify'],
+            sync_direction="spotify_to_tidal",
+        )
+        print("Opening Tidal session")
+        tidal_session = _auth.open_tidal_session()
+        if not tidal_session.check_login():
+            sys.exit("Could not connect to Tidal")
+        _audit.audit_favorites_wrapper(
+            spotify_session,
+            tidal_session,
+            config,
+            args.audit_output,
+        )
+        return
 
     # Resolve sync direction: CLI > config > default ("spotify_to_tidal")
     sync_direction = _sync.resolve_sync_direction(config, args.sync_direction)

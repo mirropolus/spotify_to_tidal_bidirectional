@@ -159,3 +159,49 @@ def test_open_spotify_session_spotify_to_tidal_read_only(mocker):
         requests_timeout=2,
         open_browser=True,
     )
+
+
+def test_open_spotify_session_uses_refresh_token_from_environment(mocker, monkeypatch):
+    monkeypatch.setenv("SPOTIFY_CLIENT_ID", "environment-client-id")
+    monkeypatch.setenv("SPOTIFY_CLIENT_SECRET", "environment-client-secret")
+    monkeypatch.setenv("SPOTIFY_REFRESH_TOKEN", "environment-refresh-token")
+    monkeypatch.setenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1/callback")
+    mock_spotify_oauth = mocker.patch(
+        "spotify_to_tidal.auth.spotipy.SpotifyOAuth", autospec=True
+    )
+    mocker.patch("spotify_to_tidal.auth.spotipy.Spotify", autospec=True)
+
+    open_spotify_session({"username": "test-user"}, sync_direction="bidirectional")
+
+    arguments = mock_spotify_oauth.call_args.kwargs
+    assert arguments["client_id"] == "environment-client-id"
+    assert arguments["client_secret"] == "environment-client-secret"
+    assert arguments["open_browser"] is False
+    assert "cache_handler" in arguments
+    mock_spotify_oauth.return_value.refresh_access_token.assert_called_once_with(
+        "environment-refresh-token"
+    )
+    mock_spotify_oauth.return_value.get_access_token.assert_not_called()
+
+
+def test_open_tidal_session_uses_environment_without_session_file(mocker, monkeypatch):
+    monkeypatch.setenv("TIDAL_ACCESS_TOKEN", "environment-access-token")
+    monkeypatch.setenv("TIDAL_REFRESH_TOKEN", "environment-refresh-token")
+    mock_session_class = mocker.patch(
+        "spotify_to_tidal.auth.tidalapi.Session", autospec=True
+    )
+    mock_session = mock_session_class.return_value
+    mock_session.load_oauth_session.return_value = True
+    file_open = mocker.patch("builtins.open")
+
+    result = open_tidal_session()
+
+    assert result == mock_session
+    mock_session.load_oauth_session.assert_called_once_with(
+        token_type="Bearer",
+        access_token="environment-access-token",
+        refresh_token="environment-refresh-token",
+        expiry_time=None,
+    )
+    mock_session.login_oauth.assert_not_called()
+    file_open.assert_not_called()

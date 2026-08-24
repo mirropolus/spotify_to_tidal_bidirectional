@@ -29,3 +29,7 @@ sync_favorites_default: true
 # increasing these parameters should increase the search speed, while decreasing reduces likelihood of 429 errors
 max_concurrency: 10 # max concurrent connections at any given time
 rate_limit:      10 # max sustained connections per second
+
+# audit thresholds (the audit never changes either account)
+audit_timestamp_mismatch_days: 30
+audit_timestamp_cluster_size: 3

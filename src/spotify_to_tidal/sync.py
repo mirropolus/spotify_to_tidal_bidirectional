@@ -5,6 +5,7 @@ from .cache import failure_cache, track_match_cache, reverse_track_match_cache
 import datetime
 from difflib import SequenceMatcher
 from functools import partial
+import logging
 from typing import Callable, List, Sequence, Set, Mapping
 import math
 import requests
@@ -23,6 +24,13 @@ from .type import spotify as t_spotify
 from .type import SyncDirectionLiteral, PlaylistConfig
 
 _VALID_SYNC_DIRECTIONS = {"spotify_to_tidal", "tidal_to_spotify", "bidirectional"}
+SPOTIFY_TIMESTAMPED_TRACK_BATCH_SIZE = 50
+
+logger = logging.getLogger(__name__)
+
+
+class SpotifyTimestampSaveError(RuntimeError):
+    """Spotify rejected a timestamp-preserving Liked Songs request."""
 
 
 def resolve_sync_direction(config: dict, cli_override: str | None) -> SyncDirectionLiteral:
@@ -170,7 +178,13 @@ async def tidal_search(spotify_track, rate_limiter, tidal_session: tidalapi.Sess
     # if none of the search modes succeeded then store the track id to the failure cache
     failure_cache.cache_match_failure(spotify_track['id'])
 
-async def spotify_search(tidal_track: tidalapi.Track, rate_limiter: asyncio.Semaphore, spotify_session: spotipy.Spotify):
+async def spotify_search(
+    tidal_track: tidalapi.Track,
+    rate_limiter: asyncio.Semaphore,
+    spotify_session: spotipy.Spotify,
+    *,
+    record_failure: bool = True,
+):
     """
     Searches Spotify for the equivalent of a Tidal track.
     1. Try ISRC match via spotify_session.search(q=f"isrc:{tidal_track.isrc}", type="track")
@@ -188,7 +202,8 @@ async def spotify_search(tidal_track: tidalapi.Track, rate_limiter: asyncio.Sema
     )
     for candidate in isrc_results.get('tracks', {}).get('items', []):
         if match(tidal_track, candidate):
-            failure_cache.remove_match_failure(cache_key)
+            if record_failure:
+                failure_cache.remove_match_failure(cache_key)
             return candidate
 
     # Step 2: fall back to name + first artist search
@@ -200,11 +215,14 @@ async def spotify_search(tidal_track: tidalapi.Track, rate_limiter: asyncio.Sema
     )
     for candidate in name_results.get('tracks', {}).get('items', []):
         if match(tidal_track, candidate):
-            failure_cache.remove_match_failure(cache_key)
+            if record_failure:
+                failure_cache.remove_match_failure(cache_key)
             return candidate
 
-    # Both steps failed — record the miss
-    failure_cache.cache_match_failure(cache_key)
+    # Both steps failed — record the miss during normal syncs. Audits deliberately
+    # avoid modifying the matching cache.
+    if record_failure:
+        failure_cache.cache_match_failure(cache_key)
     return None
 
 
@@ -310,6 +328,90 @@ async def _fetch_all_from_spotify_in_chunks(fetch_function: Callable) -> List[di
             output.extend([item['track'] for item in extra_result['items'] if item['track'] is not None])
 
     return output
+
+
+async def get_spotify_saved_track_items(
+    spotify_session: spotipy.Spotify,
+) -> List[dict]:
+    """Load all Liked Songs while preserving saved-item metadata such as added_at."""
+    output: List[dict] = []
+
+    def fetch(offset: int):
+        return spotify_session.current_user_saved_tracks(limit=50, offset=offset)
+
+    results = fetch(0)
+    output.extend(
+        item for item in results['items']
+        if item.get('track') is not None
+    )
+
+    if results['next']:
+        offsets = [
+            results['limit'] * n
+            for n in range(1, math.ceil(results['total'] / results['limit']))
+        ]
+        extra_results = await atqdm.gather(
+            *[asyncio.to_thread(fetch, offset) for offset in offsets],
+            desc="Fetching additional Liked Songs chunks",
+        )
+        for extra_result in extra_results:
+            output.extend(
+                item for item in extra_result['items']
+                if item.get('track') is not None
+            )
+
+    return output
+
+
+def spotify_added_at(timestamp: datetime.datetime) -> str:
+    """Convert a Tidal datetime to Spotify's required UTC ISO 8601 format."""
+    if not isinstance(timestamp, datetime.datetime):
+        raise TypeError("added_at must be a datetime")
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        logger.warning("Timezone-naive Tidal date_added treated as UTC")
+        timestamp = timestamp.replace(tzinfo=datetime.timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(datetime.timezone.utc)
+    return timestamp.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _put_timestamped_spotify_tracks(
+    spotify_session: spotipy.Spotify,
+    payload: dict,
+):
+    """Send one timestamped batch and turn non-retriable rejections into a clear error."""
+    try:
+        return spotify_session._put("me/tracks", payload=payload)
+    except spotipy.exceptions.SpotifyException as exc:
+        status = getattr(exc, "http_status", None)
+        if status is None or (status != 429 and status < 500):
+            status_label = status if status is not None else "unknown"
+            raise SpotifyTimestampSaveError(
+                "Spotify rejected the timestamp-preserving Liked Songs payload "
+                f"(HTTP {status_label}); no non-timestamped fallback was attempted."
+            ) from exc
+        raise
+
+
+async def save_spotify_tracks_with_timestamps(
+    spotify_session: spotipy.Spotify,
+    tracks: Sequence[tuple[str, datetime.datetime]],
+) -> None:
+    """Save Spotify track IDs with historical timestamps in batches of 50."""
+    for offset in range(0, len(tracks), SPOTIFY_TIMESTAMPED_TRACK_BATCH_SIZE):
+        batch = tracks[offset:offset + SPOTIFY_TIMESTAMPED_TRACK_BATCH_SIZE]
+        payload = {
+            "timestamped_ids": [
+                {"id": spotify_id, "added_at": spotify_added_at(added_at)}
+                for spotify_id, added_at in batch
+            ]
+        }
+        await repeat_on_request_error(
+            asyncio.to_thread,
+            _put_timestamped_spotify_tracks,
+            spotify_session,
+            payload,
+        )
 
 
 async def get_tracks_from_spotify_playlist(spotify_session: spotipy.Spotify, spotify_playlist):
@@ -713,32 +815,64 @@ async def sync_favorites(spotify_session: spotipy.Spotify, tidal_session: tidala
 async def sync_favorites_tidal_to_spotify(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, config: dict) -> None:
     """
     Reads Tidal favorites, searches for Spotify equivalents,
-    and adds matched tracks to Spotify Liked Songs (skipping duplicates).
+    and adds matched tracks to Spotify Liked Songs with their original Tidal
+    date_added values. Existing Spotify likes are never submitted again.
     """
     print("Loading favorite tracks from Tidal")
-    tidal_tracks = await get_all_favorites(tidal_session.user.favorites, order='DATE')
+    # Ordering is deterministic but not semantically required: each request item
+    # carries its own timestamp, so batch/request order cannot change chronology.
+    tidal_tracks = await get_all_favorites(
+        tidal_session.user.favorites,
+        order='DATE',
+        order_direction='ASC',
+    )
 
     print("Loading existing Liked Songs from Spotify")
-    _get_liked_tracks = lambda offset: spotify_session.current_user_saved_tracks(offset=offset)
-    existing_spotify_liked = await repeat_on_request_error(_fetch_all_from_spotify_in_chunks, _get_liked_tracks)
+    existing_spotify_liked = await repeat_on_request_error(
+        get_spotify_saved_track_items,
+        spotify_session,
+    )
 
-    existing_liked_ids = {t['id'] for t in existing_spotify_liked if t}
+    existing_liked_ids = {
+        item['track']['id']
+        for item in existing_spotify_liked
+        if item.get('track') and item['track'].get('id')
+    }
 
     await search_new_tracks_on_spotify(spotify_session, tidal_tracks, "Favorites", config)
 
-    new_liked_ids = []
+    new_likes: list[tuple[str, datetime.datetime]] = []
+    queued_ids: set[str] = set()
     for tidal_track in tidal_tracks:
         spotify_id = reverse_track_match_cache.get(f"tidal:{tidal_track.id}")
-        if spotify_id and spotify_id not in existing_liked_ids:
-            new_liked_ids.append(spotify_id)
+        if (
+            not spotify_id
+            or spotify_id in existing_liked_ids
+            or spotify_id in queued_ids
+        ):
+            continue
 
-    if not new_liked_ids:
+        date_added = (
+            getattr(tidal_track, "date_added", None)
+            or getattr(tidal_track, "user_date_added", None)
+        )
+        if not isinstance(date_added, datetime.datetime):
+            logger.warning(
+                "Skipping Tidal favorite %s (%s): date_added is missing or invalid; "
+                "no timestamp was invented",
+                tidal_track.id,
+                getattr(tidal_track, "name", "unknown track"),
+            )
+            continue
+
+        new_likes.append((spotify_id, date_added))
+        queued_ids.add(spotify_id)
+
+    if not new_likes:
         print("No new tracks to add to Spotify Liked Songs")
         return
 
-    for i in tqdm(range(0, len(new_liked_ids), 20), desc="Adding new tracks to Spotify Liked Songs"):
-        batch = new_liked_ids[i:i + 20]
-        await repeat_on_request_error(asyncio.to_thread, spotify_session.current_user_saved_tracks_add, batch)
+    await save_spotify_tracks_with_timestamps(spotify_session, new_likes)
 
 
 def sync_playlists_wrapper(spotify_session: spotipy.Spotify, tidal_session: tidalapi.Session, playlists, config: dict):
@@ -847,4 +981,3 @@ def get_playlists_from_config(spotify_session: spotipy.Spotify, tidal_session: t
             # "spotify_to_tidal" and "bidirectional" both use (spotify_playlist, tidal_playlist)
             output.append((spotify_playlist, tidal_playlist))
     return output
-
