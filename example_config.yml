@@ -34,3 +34,7 @@ rate_limit:      10 # max sustained connections per second
 audit_timestamp_mismatch_days: 30
 audit_timestamp_cluster_size: 3
 audit_timestamp_cluster_min_delta_hours: 24
+
+# dry-run only: block Spotify -> Tidal candidates from dense added_at clusters
+# that may have originated in an older bulk import
+dry_run_origin_cluster_size: 3
