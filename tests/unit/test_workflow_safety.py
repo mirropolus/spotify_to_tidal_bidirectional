@@ -25,6 +25,7 @@ def test_manual_workflow_is_non_mutating_timestamp_capability_check_only():
     assert "--sync-direction tidal_to_spotify" not in sync_command
     assert "--sync-direction bidirectional" not in sync_command
     assert "--approved-favorites-plan" not in sync_command
+    assert "--execute-ordered-import" not in sync_command
     assert "--uri" not in sync_command
 
     environment = workflow["jobs"]["check"]["env"]

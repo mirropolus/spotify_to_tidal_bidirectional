@@ -1,12 +1,14 @@
 import yaml
 import argparse
 from pathlib import Path
+from spotipy.exceptions import SpotifyException
 import sys
 
 from . import sync as _sync
 from . import auth as _auth
 from . import audit as _audit
 from . import dry_run as _dry_run
+from . import ordered_import as _ordered_import
 
 def main():
     parser = argparse.ArgumentParser()
@@ -50,6 +52,46 @@ def main():
         ),
     )
     parser.add_argument(
+        '--prepare-ordered-import',
+        metavar='REVIEWED_DRY_RUN_CSV',
+        help=(
+            'create a read-only, oldest-to-newest import checkpoint from safe '
+            'tidal_to_spotify would_add rows'
+        ),
+    )
+    parser.add_argument(
+        '--ordered-import-output',
+        default='favorites_ordered_import.csv',
+        help=(
+            'checkpoint path for --prepare-ordered-import '
+            '(default: favorites_ordered_import.csv)'
+        ),
+    )
+    parser.add_argument(
+        '--execute-ordered-import',
+        metavar='CHECKPOINT_CSV',
+        help=(
+            'create the exact private archive playlist and like checkpoint '
+            'tracks one at a time in relative chronological order'
+        ),
+    )
+    parser.add_argument(
+        '--accept-current-spotify-dates',
+        action='store_true',
+        help='required acknowledgement for --execute-ordered-import',
+    )
+    parser.add_argument(
+        '--ordered-import-playlist-name',
+        default=_ordered_import.DEFAULT_ARCHIVE_PLAYLIST_NAME,
+        help='private Spotify archive playlist name for ordered import',
+    )
+    parser.add_argument(
+        '--ordered-import-spacing-seconds',
+        type=int,
+        default=_ordered_import.DEFAULT_SPACING_SECONDS,
+        help='delay between sequential likes (minimum and default: 65 seconds)',
+    )
+    parser.add_argument(
         '--sync-direction',
         dest='sync_direction',
         choices=['spotify_to_tidal', 'tidal_to_spotify', 'bidirectional'],
@@ -60,6 +102,92 @@ def main():
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f) or {}
+
+    ordered_mode = bool(
+        args.prepare_ordered_import or args.execute_ordered_import
+    )
+    if args.prepare_ordered_import and args.execute_ordered_import:
+        sys.exit(
+            "Choose either --prepare-ordered-import or "
+            "--execute-ordered-import, not both"
+        )
+    if ordered_mode:
+        incompatible = any([
+            args.uri,
+            args.sync_favorites is not None,
+            args.audit_favorites,
+            args.dry_run,
+            args.dry_run_audit_input,
+            args.approved_favorites_plan,
+            args.check_spotify_timestamp_support,
+            args.sync_direction,
+        ])
+        if incompatible:
+            sys.exit(
+                "Ordered import modes must be run by themselves "
+                "(apart from --config and ordered-import options)"
+            )
+    if args.prepare_ordered_import:
+        if args.accept_current_spotify_dates:
+            sys.exit(
+                "--accept-current-spotify-dates is only valid with "
+                "--execute-ordered-import"
+            )
+        if not Path(args.prepare_ordered_import).is_file():
+            sys.exit(
+                "--prepare-ordered-import does not exist or is not a file: "
+                f"{args.prepare_ordered_import}"
+            )
+        try:
+            _ordered_import.prepare_ordered_import(
+                args.prepare_ordered_import,
+                args.ordered_import_output,
+            )
+        except (OSError, _ordered_import.OrderedImportError) as exc:
+            sys.exit(f"Invalid ordered import plan: {exc}")
+        return
+    if args.execute_ordered_import:
+        if not args.accept_current_spotify_dates:
+            sys.exit(
+                "--execute-ordered-import requires "
+                "--accept-current-spotify-dates"
+            )
+        if not Path(args.execute_ordered_import).is_file():
+            sys.exit(
+                "--execute-ordered-import does not exist or is not a file: "
+                f"{args.execute_ordered_import}"
+            )
+        if (
+            args.ordered_import_spacing_seconds
+            < _ordered_import.MINIMUM_SPACING_SECONDS
+        ):
+            sys.exit(
+                "--ordered-import-spacing-seconds must be at least "
+                f"{_ordered_import.MINIMUM_SPACING_SECONDS}"
+            )
+        print("Opening Spotify ordered-import session")
+        spotify_session = _auth.open_spotify_session(
+            config['spotify'],
+            sync_direction="tidal_to_spotify",
+        )
+        try:
+            _ordered_import.execute_ordered_import(
+                spotify_session,
+                args.execute_ordered_import,
+                playlist_name=args.ordered_import_playlist_name,
+                spacing_seconds=args.ordered_import_spacing_seconds,
+            )
+        except (
+            OSError,
+            SpotifyException,
+            _ordered_import.OrderedImportError,
+        ) as exc:
+            sys.exit(f"Ordered import stopped safely: {exc}")
+        return
+    if args.accept_current_spotify_dates:
+        sys.exit(
+            "--accept-current-spotify-dates requires --execute-ordered-import"
+        )
 
     if args.check_spotify_timestamp_support:
         incompatible = any([

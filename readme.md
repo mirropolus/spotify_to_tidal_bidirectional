@@ -320,6 +320,58 @@ not search or add a different Spotify version when any existing Liked Songs
 track already matches the recording. The dry-run plan remains advisory and
 does not repair historical timestamps.
 
+### Preserve relative order when historical timestamps are unavailable
+
+If Spotify rejects the timestamp-preserving endpoint but relative order is an
+acceptable substitute, first create a read-only ordered checkpoint from the
+reviewed dry-run:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --config config.yml \
+  --prepare-ordered-import favorites_dry_run_reviewed.csv \
+  --ordered-import-output favorites_ordered_import.csv
+```
+
+This command does not authenticate to either provider. It accepts only
+unflagged `tidal_to_spotify:would_add` rows with exact matching source and
+destination ISRCs and complete Tidal timestamps. It rejects duplicate source
+IDs, destination IDs, and recording ISRCs, sorts the accepted rows oldest to
+newest, and writes a plan digest that detects later changes to IDs, dates, or
+metadata.
+
+After manually reviewing the checkpoint, execute it locally with an explicit
+acknowledgement that Spotify will assign current dates:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --config config.yml \
+  --execute-ordered-import favorites_ordered_import.csv \
+  --accept-current-spotify-dates
+```
+
+The executor authenticates only to Spotify. Before writing, it reloads Liked
+Songs, rejects any existing exact target or ISRC-equivalent recording, and
+fetches every target again to confirm the reviewed ID and ISRC. It then:
+
+1. Creates a private `Tidal Favorites — Chronological Archive` playlist.
+2. Adds the tracks in exact oldest-to-newest order using Spotify's ordered
+   playlist-items endpoint.
+3. Verifies that the playlist is an exact plan prefix before appending, so a
+   partial run can resume without replacing or removing playlist items.
+4. Likes one track at a time through `PUT /me/library`, oldest to newest, with a
+   65-second delay between tracks.
+5. Reads the new Spotify `added_at` after every like and stops before the next
+   write unless timestamps are strictly increasing.
+
+The checkpoint is updated atomically before and after every like. A
+`like_requested` row lets a restarted process adopt a successful request that
+was interrupted before local verification instead of repeating it. No unlike,
+playlist replacement, deletion, timestamped endpoint, or Tidal write is used.
+For 12 tracks, a complete uninterrupted run takes approximately 12 minutes.
+The CSV remains the authoritative record of the original Tidal dates, while the
+private playlist is the authoritative exact Spotify order.
+
 ---
 
 ## Bidirectional sync
