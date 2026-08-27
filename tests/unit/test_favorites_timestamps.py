@@ -8,7 +8,9 @@ from spotipy.exceptions import SpotifyException
 
 from spotify_to_tidal.sync import (
     SPOTIFY_TIMESTAMPED_TRACK_BATCH_SIZE,
+    SPOTIFY_TIMESTAMP_403_MESSAGE,
     SpotifyTimestampSaveError,
+    check_spotify_timestamp_support,
     save_spotify_tracks_with_timestamps,
     sync_favorites_tidal_to_spotify,
 )
@@ -288,5 +290,49 @@ def test_spotify_payload_rejection_is_clear_and_has_no_fallback():
                 [("spotify-1", timestamp)],
             )
         )
+
+    spotify.current_user_saved_tracks_add.assert_not_called()
+
+
+def test_spotify_timestamp_403_explains_mode_without_claiming_quota_exhaustion():
+    spotify = MagicMock()
+    spotify._put.side_effect = SpotifyException(403, -1, "Forbidden")
+    timestamp = datetime.datetime(2021, 5, 12, tzinfo=UTC)
+
+    with pytest.raises(SpotifyTimestampSaveError) as exc_info:
+        asyncio.run(
+            save_spotify_tracks_with_timestamps(
+                spotify,
+                [("spotify-1", timestamp)],
+            )
+        )
+
+    assert str(exc_info.value) == SPOTIFY_TIMESTAMP_403_MESSAGE
+    assert "HTTP 429" in str(exc_info.value)
+    assert "No PUT /me/library fallback" in str(exc_info.value)
+    spotify.current_user_saved_tracks_add.assert_not_called()
+
+
+def test_spotify_timestamp_capability_probe_is_empty_and_non_mutating():
+    spotify = MagicMock()
+
+    check_spotify_timestamp_support(spotify)
+
+    spotify._put.assert_called_once_with(
+        "me/tracks",
+        payload={"timestamped_ids": []},
+    )
+    spotify.current_user_saved_tracks_add.assert_not_called()
+
+
+def test_spotify_timestamp_capability_probe_fails_closed_on_403():
+    spotify = MagicMock()
+    spotify._put.side_effect = SpotifyException(403, -1, "Forbidden")
+
+    with pytest.raises(
+        SpotifyTimestampSaveError,
+        match="New Development Mode Client IDs",
+    ):
+        check_spotify_timestamp_support(spotify)
 
     spotify.current_user_saved_tracks_add.assert_not_called()

@@ -42,6 +42,14 @@ def main():
         help='reviewed dry-run CSV required before Spotify-to-Tidal favorite writes',
     )
     parser.add_argument(
+        '--check-spotify-timestamp-support',
+        action='store_true',
+        help=(
+            'send an empty, non-mutating request to check whether this Spotify '
+            'Client ID can preserve historical Liked Songs timestamps'
+        ),
+    )
+    parser.add_argument(
         '--sync-direction',
         dest='sync_direction',
         choices=['spotify_to_tidal', 'tidal_to_spotify', 'bidirectional'],
@@ -52,6 +60,37 @@ def main():
 
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f) or {}
+
+    if args.check_spotify_timestamp_support:
+        incompatible = any([
+            args.uri,
+            args.sync_favorites is not None,
+            args.audit_favorites,
+            args.dry_run,
+            args.dry_run_audit_input,
+            args.approved_favorites_plan,
+            args.sync_direction,
+        ])
+        if incompatible:
+            sys.exit(
+                "--check-spotify-timestamp-support must be run by itself "
+                "(apart from --config)"
+            )
+        print("Opening Spotify timestamp-capability session")
+        spotify_session = _auth.open_spotify_session(
+            config['spotify'],
+            sync_direction="tidal_to_spotify",
+        )
+        print("Checking Spotify timestamp support (empty request; no library changes)")
+        try:
+            _sync.check_spotify_timestamp_support(spotify_session)
+        except _sync.SpotifyTimestampSaveError as exc:
+            sys.exit(str(exc))
+        print(
+            "Supported: Spotify accepted the non-mutating timestamp probe. "
+            "This Client ID can proceed to the reviewed Tidal-to-Spotify test."
+        )
+        return
 
     if args.audit_favorites and args.dry_run:
         sys.exit("Choose either --audit-favorites or --dry-run, not both")

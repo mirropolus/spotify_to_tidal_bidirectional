@@ -33,6 +33,18 @@ class SpotifyTimestampSaveError(RuntimeError):
     """Spotify rejected a timestamp-preserving Liked Songs request."""
 
 
+SPOTIFY_TIMESTAMP_403_MESSAGE = (
+    "Spotify denied the timestamp-preserving PUT /me/tracks endpoint (HTTP 403). "
+    "This is not a Development Mode quota-exhaustion response; Spotify reports "
+    "quota exhaustion as HTTP 429 with reason QUOTA_EXCEEDED. New Development "
+    "Mode Client IDs may not use this deprecated endpoint even when the token "
+    "contains user-library-modify. Use a Client ID that already has access to "
+    "PUT /me/tracks (for example, an eligible pre-February 11, 2026 app or an "
+    "Extended Quota app). No PUT /me/library fallback was attempted because that "
+    "endpoint cannot preserve historical added_at timestamps."
+)
+
+
 def resolve_sync_direction(config: dict, cli_override: str | None) -> SyncDirectionLiteral:
     """
     Returns the effective sync direction.
@@ -496,6 +508,10 @@ def _put_timestamped_spotify_tracks(
         return spotify_session._put("me/tracks", payload=payload)
     except spotipy.exceptions.SpotifyException as exc:
         status = getattr(exc, "http_status", None)
+        if status == 403:
+            raise SpotifyTimestampSaveError(
+                SPOTIFY_TIMESTAMP_403_MESSAGE
+            ) from exc
         if status is None or (status != 429 and status < 500):
             status_label = status if status is not None else "unknown"
             raise SpotifyTimestampSaveError(
@@ -503,6 +519,35 @@ def _put_timestamped_spotify_tracks(
                 f"(HTTP {status_label}); no non-timestamped fallback was attempted."
             ) from exc
         raise
+
+
+def check_spotify_timestamp_support(
+    spotify_session: spotipy.Spotify,
+) -> None:
+    """Probe timestamp support with an empty, non-mutating request.
+
+    Spotify does not publish the effective endpoint set in an OAuth token or a
+    stable dashboard field. An empty ``timestamped_ids`` array exercises the
+    same authorization path as a real timestamped save without naming or
+    changing any library item.
+    """
+    try:
+        spotify_session._put(
+            "me/tracks",
+            payload={"timestamped_ids": []},
+        )
+    except spotipy.exceptions.SpotifyException as exc:
+        status = getattr(exc, "http_status", None)
+        if status == 403:
+            raise SpotifyTimestampSaveError(
+                SPOTIFY_TIMESTAMP_403_MESSAGE
+            ) from exc
+        status_label = status if status is not None else "unknown"
+        raise SpotifyTimestampSaveError(
+            "Spotify did not accept the non-mutating timestamp capability "
+            f"probe (HTTP {status_label}). Timestamp support could not be "
+            "confirmed, so no synchronization was attempted."
+        ) from exc
 
 
 async def save_spotify_tracks_with_timestamps(

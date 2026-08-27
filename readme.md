@@ -140,6 +140,51 @@ The timestamped format is currently available on Spotify's
 Spotify marks that endpoint deprecated in favor of the generic library endpoint,
 but the generic endpoint does not currently expose historical timestamps.
 
+Before a real Tidal-to-Spotify run, check the effective capability of the exact
+Spotify Client ID in `config.yml`:
+
+```bash
+python3.11 -m spotify_to_tidal \
+  --config config.yml \
+  --check-spotify-timestamp-support
+```
+
+The probe sends `{"timestamped_ids": []}` to `PUT /me/tracks`. It names no
+tracks and does not change the library. Spotify does not expose endpoint access
+as a stable OAuth-token field, and the Developer Dashboard may not show a
+prominent Development/Extended mode label. Newly created apps are Development
+Mode by default. A `403` from this probe means that the Client ID cannot use the
+timestamp-preserving endpoint; quota exhaustion is a different failure reported
+as `429` with `reason: QUOTA_EXCEEDED` (see Spotify's
+[quota mode documentation](https://developer.spotify.com/documentation/web-api/concepts/quota-modes)).
+
+New Development Mode Client IDs created under Spotify's February 2026 endpoint
+restrictions must use `PUT /me/library`, which cannot supply historical
+`added_at` values. Existing Development Mode endpoint restrictions were
+[postponed](https://developer.spotify.com/blog/2026-02-06-update-on-developer-access-and-platform-security),
+so an eligible Client ID created before February 11, 2026 may still pass the
+probe. Extended Quota access is now an organization/partner review path, not a
+personal dashboard toggle. The sync deliberately never falls back to
+`PUT /me/library` because doing so would assign the current time.
+
+To inspect Spotipy's cached scopes without accidentally opening the unrelated
+SQLite `.cache.db`, limit the glob to the JSON token files:
+
+```bash
+python - <<'PY'
+import glob
+import json
+
+for path in glob.glob(".cache-*"):
+    try:
+        with open(path, encoding="utf-8") as cache_file:
+            token = json.load(cache_file)
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        continue
+    print(path, token.get("scope", "<missing>"))
+PY
+```
+
 > Versions of this fork before this fix may have imported old Tidal favorites
 > with a new Spotify `added_at`. Normal syncs do not repair those historical
 > entries because doing so would require destructive remove/re-add operations.
@@ -342,15 +387,13 @@ sync_playlists:
 
 ---
 
-## Manual favorites sync with GitHub Actions
+## Manual Spotify capability check with GitHub Actions
 
 `.github/workflows/sync.yml` currently provides only a manual
-`workflow_dispatch` trigger. For the first production validation, its command
-is deliberately limited to `--sync-favorites --sync-direction
-tidal_to_spotify`. It can add the reviewed missing Tidal favorites to Spotify
-Liked Songs with their historical timestamps, but it does not write Spotify
-likes back to Tidal, synchronize playlists, or run an automatic historical
-repair.
+`workflow_dispatch` trigger. While the configured Spotify Client ID cannot use
+the timestamp-preserving endpoint, the workflow runs only
+`--check-spotify-timestamp-support`. The empty probe cannot add favorites,
+synchronize playlists, write to Tidal, or run a historical repair.
 
 Create these repository secrets under **Settings → Secrets and variables →
 Actions** before enabling the workflow:
@@ -360,29 +403,25 @@ Actions** before enabling the workflow:
 | `SPOTIFY_CLIENT_ID` | Spotify application client ID |
 | `SPOTIFY_CLIENT_SECRET` | Spotify application client secret |
 | `SPOTIFY_REFRESH_TOKEN` | Refresh token from a prior local Spotify authorization with the required scopes |
-| `TIDAL_ACCESS_TOKEN` | Access token from a prior local Tidal OAuth session |
-| `TIDAL_REFRESH_TOKEN` | Refresh token from that Tidal OAuth session |
 
 Authentication remains backward-compatible locally: Spotipy uses its existing
-cache and Tidal uses `.session.yml`. In CI, the environment variables above are
-used explicitly, browser login is disabled, and refreshed Spotify tokens are
-held in memory rather than written to `.cache-*`. Tidal environment credentials
-are likewise not written to `.session.yml`.
+cache and Tidal uses `.session.yml`. In CI, the Spotify environment variables
+above are used explicitly, browser login is disabled, and refreshed Spotify
+tokens are held in memory rather than written to `.cache-*`. The capability
+workflow does not load or require Tidal credentials.
 
 Do not commit token caches or use them as workflow artifacts. `config.yml`,
 `config.yaml`, `.cache*`, `.session.yml`, `.env`, and generated favorites audit
 CSVs are ignored by Git. The workflow grants only read access to repository
 contents and does not upload session files or caches.
 
-After merging, add the secrets and use **Run workflow** for the first real
-production execution. The current one-way command is the deliberately narrow
-first step: review its logs and run another favorites audit before enabling the
-Spotify → Tidal side. That second side must use an explicitly reviewed
-`--approved-favorites-plan`; do not change the workflow to bidirectional without
-providing and reviewing that plan. The daily `schedule` trigger is intentionally
-omitted for now and should be added in a later change only after the manual
-one-way run and its follow-up audit have been validated. Playlist synchronization
-should remain out of this workflow until it is reviewed separately.
+After merging, add the Spotify secrets and use **Run workflow** only to verify a
+candidate Client ID. Do not restore the real Tidal-to-Spotify command unless the
+probe succeeds. After a successful probe, the first real run must remain
+favorites-only and Tidal-to-Spotify; review its logs and run another favorites
+audit before enabling Spotify-to-Tidal. That second side must use an explicitly
+reviewed `--approved-favorites-plan`. The daily `schedule` trigger and playlist
+synchronization remain disabled.
 
 ---
 
